@@ -1,0 +1,10 @@
+/bin/
+/pkg/
+*.db
+*.db-shm
+*.db-wal
+/gatekeeper.yaml
+/gatekeeper-agent.yaml
+.idea/
+.vscode/
+*.out

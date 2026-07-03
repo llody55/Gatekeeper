@@ -1,0 +1,55 @@
+# Gatekeeper Server 配置示例
+# 拷贝到以下任一位置即可被自动加载:
+#   ./gatekeeper.yaml | ~/.gatekeeper/gatekeeper.yaml | /etc/gatekeeper/gatekeeper.yaml
+# 也可用 -config <path> 显式指定。命令行 flag 与同名环境变量会覆盖本文件。
+
+# 监听地址。生产建议内网 + 443 端口套 TLS。
+listen: ":8443"
+
+# SQLite 数据库路径。WAL 模式，可热备份(复制主文件 + 一次性 checkpoint 即可)。
+db_path: "/var/lib/gatekeeper/gatekeeper.db"
+
+# 日志级别: debug / info / warn / error
+log_level: "info"
+
+tls:
+  cert: ""  # /etc/gatekeeper/server.crt
+  key:  ""  # /etc/gatekeeper/server.key
+
+ui:
+  # 管理员登录口令。留空则首次启动自动生成并打印一次到日志，写入数据库 settings 表。
+  # 生产建议显式设置强口令；遗忘时可清空 settings.admin_password 行再重启触发重新生成。
+  admin_password: "REPLACE-WITH-REAL-PASSWORD"
+  # 会话有效期(默认 12h)。浏览器登录后 token 存 localStorage。
+  session_ttl: "12h"
+  # 是否允许通过 ?t=<admin_password> 直接访问, 生产务必 false。
+  allow_query_token: false
+
+agent:
+  # 启动时自动登记此 agent token，便于首次接入。也可登录后在 Token 页生成。
+  # 注意: 生产等保环境建议每台主机单独发放 token 并显式 bind_agent_id；bootstrap_token 仅用于首装。
+  bootstrap_token: ""
+  # 心跳超时(超过则判定离线，UI 上灰点)。默认 90s。
+  heartbeat_timeout: "90s"
+  # 写超时。默认 10s。
+  write_timeout: "10s"
+  # 是否把 bootstrap token 在首次被某 agent 注册时自动绑定到该 agent_id。
+  # 开启后即便 bootstrap_token 泄露，攻击者也无法用它在另一台机器冒名注册别的 agent_id。
+  # 默认 true(等保环境推荐保持)。
+  bind_bootstrap_token: true
+
+# 信任的前置代理 CIDR 列表。仅当直连对端 IP 命中此列表时才解析 X-Forwarded-For；
+# 否则一律使用直连 IP 做登录限速 / 审计，避免公网部署被伪造 XFF 绕过。
+# 公网直连或等保环境请留空 []；只有当你前置 nginx/HAProxy 反代时才加入它们所在网段。
+# 用 "any" 表示无条件信任(不安全, 仅测试用)。
+trusted_proxies: []
+# 示例(反代场景):
+# trusted_proxies:
+#   - "127.0.0.1/8"
+#   - "10.0.0.0/8"
+
+defaults:
+  # 单条指令未回执的超时，超时自动标记 timeout。默认 60s。
+  cmd_timeout: "60s"
+  # 历史指令保留时长(留空=永久)。后续会做自动清理。
+  history_retention: "720h"  # 30 天

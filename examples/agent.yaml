@@ -1,0 +1,25 @@
+# Gatekeeper Agent 配置示例
+# 拷贝到 /etc/gatekeeper/agent.yaml 即可被自动加载，或用 -config <path> 指定。
+
+# Server 的 WebSocket 地址: ws:// (明文) 或 wss:// (TLS)。
+# 混合云/跨防火墙场景: agent 反向出站到 server，目标端口建议 443/8443。
+server_url: "ws://192.168.1.238:8443/agent"
+
+# 预共享 token。由管理员在 Web 控制台 Token 页生成。
+# 也可通过环境变量 GATEKEEPER_AGENT_TOKEN 注入(systemd 安全做法,避免写在文件)。
+token: "REPLACE-WITH-REAL-TOKEN"
+
+# 可选: 显式指定 agent 唯一 id, 留空则 hostname+随机数生成。
+agent_id: ""
+
+# 心跳间隔(默认 30s)。
+heartbeat: "30s"
+
+# 重连退避的起止区间(默认 2s -> 60s 指数翻倍)。
+reconnect_min: "2s"
+reconnect_max: "60s"
+
+# wss 时是否跳过证书校验(自签证书内网可用, 公网强烈不推荐)。
+insecure_tls: false
+
+log_level: "info"
