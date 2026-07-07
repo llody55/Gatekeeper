@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"gatekeeper/internal/proto"
+	"gatekeeper/internal/version"
 
 	"github.com/gorilla/websocket"
 )
@@ -55,7 +56,7 @@ func Run(ctx context.Context, opts Options) {
 		opts.ReconnectMax = 60 * time.Second
 	}
 	hostname, _ := os.Hostname()
-	log.Printf("[gatekeeper-agent] id=%s hostname=%s 开始反连 %s", opts.AgentID, hostname, opts.ServerURL)
+	log.Printf("[gatekeeper-agent] v%s id=%s hostname=%s 开始反连 %s", version.String(), opts.AgentID, hostname, opts.ServerURL)
 
 	backoff := opts.ReconnectMin
 	for {

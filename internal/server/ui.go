@@ -18,13 +18,14 @@ func uiHTML() string {
 		uiCSS() +
 		"</style></head><body>\n" +
 		"<header class=\"top\">\n" +
-		"  <div class=\"brand\"><span class=\"logo\"> GK </span><div><b>Gatekeeper</b><span class=\"v\">v0.3 · 在线账户救援</span></div></div>\n" +
+		"  <div class=\"brand\"><span class=\"logo\"> GK </span><div><b>Gatekeeper</b><span class=\"v\" id=\"brandVer\">v0.5.0 · 在线账户救援</span></div></div>\n" +
 		"  <nav class=\"tabs\" id=\"tabs\">\n" +
 		"    <button class=\"active\" data-tab=\"agents\">主&shy;机</button>\n" +
 		"    <button data-tab=\"rescue\">救&shy;援</button>\n" +
 		"    <button data-tab=\"cmd\">指令历史</button>\n" +
 		"    <button data-tab=\"audit\">审计日志</button>\n" +
 		"    <button data-tab=\"tokens\">Token</button>\n" +
+		"    <button data-tab=\"users\" class=\"admin-only\">用&shy;户</button>\n" +
 		"  </nav>\n" +
 		"  <div class=\"uinfo\" id=\"uinfo\"></div>\n" +
 		"</header>\n" +
@@ -32,8 +33,9 @@ func uiHTML() string {
 		"  <div class=\"login-card\">\n" +
 		"  <div class=\"login-logo\">GK</div>\n" +
 		"  <h2>账户救援控制台</h2>\n" +
-		"  <p>使用启动日志中的 admin 口令登录</p>\n" +
-		"  <input id=\"pw\" type=\"password\" placeholder=\"管理员口令\" autocomplete=\"current-password\" onkeydown=\"if(event.key==='Enter')doLogin()\">\n" +
+		"  <p>使用管理员账号登录; 首次启动仅 admin (口令见启动日志)</p>\n" +
+		"  <input id=\"lu\" type=\"text\" placeholder=\"用户名 (默认 admin)\" autocomplete=\"username\" onkeydown=\"if(event.key==='Enter')$('pw').focus()\">\n" +
+		"  <input id=\"pw\" type=\"password\" placeholder=\"口令\" autocomplete=\"current-password\" onkeydown=\"if(event.key==='Enter')doLogin()\">\n" +
 		"  <button class=\"primary block\" onclick=\"doLogin()\">登&shy;录</button>\n" +
 		"  <div id=\"loginErr\" class=\"err\" style=\"margin-top:10px\"></div>\n" +
 		"  </div>\n" +
@@ -120,6 +122,14 @@ func uiHTML() string {
 		"      <div class=\"pager\" id=\"tokPager\"></div>\n" +
 		"    </div>\n" +
 		"  </section>\n" +
+		"  <section id=\"tab-users\" class=\"tab-content hidden admin-only\">\n" +
+		"    <div class=\"card\">\n" +
+		"      <div class=\"card-h\"><h3>用户管理 (RBAC)</h3></div>\n" +
+		"      <div class=\"r\"><div class=\"field\"><label>用户名</label><input id=\"uNewName\" placeholder=\"新用户名\" style=\"width:180px\"></div><div class=\"field\"><label>口令</label><input id=\"uNewPw\" type=\"password\" placeholder=\"初始口令\" style=\"width:180px\"></div><div class=\"field\"><label>角色</label><select id=\"uNewRole\" style=\"width:120px\"><option value=\"operator\">操作员</option><option value=\"auditor\">审计员</option><option value=\"admin\">管理员</option></select></div><button class=\"primary\" onclick=\"createUser()\">新建</button></div>\n" +
+		"      <div class=\"hint\">角色说明: 管理员=全权(含 Token/用户管理), 操作员=仅能下发救援+看审计, 审计员=只读审计。</div>\n" +
+		"    </div>\n" +
+		"    <div class=\"card\"><table class=\"tbl\"><thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody id=\"uBody\"></tbody></table></div>\n" +
+		"  </section>\n" +
 		"</main>\n" +
 		"<div class=\"toast\" id=\"toast\"></div>\n" +
 		"<script>\n" +
@@ -202,10 +212,10 @@ func uiJS() string {
 	return "let TOK=localStorage.getItem('gk_tok')||'';\n" +
 		"let agents=[], cmds=[], audit=[], tokens=[];\n" +
 		"let selectedAgents=new Set();\n" +
-		"let agentPage=1,agentSize=20,agentTotal=0,agentPages=1;\n" +
-		"let cmdPage=1,cmdSize=20,cmdTotal=0,cmdPages=1;\n" +
-		"let auditPage=1,auditSize=50,auditTotal=0,auditPages=1;\n" +
-		"let tokPage=1,tokSize=50,tokTotal=0,tokPages=1;\n" +
+		"let agentPage=1,agentSize=10,agentTotal=0,agentPages=1;\n" +
+		"let cmdPage=1,cmdSize=10,cmdTotal=0,cmdPages=1;\n" +
+		"let auditPage=1,auditSize=10,auditTotal=0,auditPages=1;\n" +
+		"let tokPage=1,tokSize=10,tokTotal=0,tokPages=1;\n" +
 		"async function api(path, opts, body){\n" +
 		"  const r = await fetch('/api'+path, {headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'}, method:opts||'GET', body:body?JSON.stringify(body):undefined});\n" +
 		"  if(r.status===401 && path!=='/login' && path!=='/me'){ localStorage.removeItem('gk_tok'); TOK=''; showLogin(); throw new Error('auth'); }\n" +
@@ -218,15 +228,16 @@ func uiJS() string {
 		"function renderPager(elId, page, pages, total, size, goto, setsize){\n" +
 		"  const el=$(elId); if(!el)return;\n" +
 		"  el.innerHTML='';\n" +
-		"  if(pages<=1){ if(total>0){ const s=document.createElement('span');s.className='hint';s.textContent='共 '+total+' 条';el.appendChild(s);} return; }\n" +
-		"  const hint=document.createElement('span');hint.className='hint';hint.textContent='共 '+total+' 条 / '+pages+' 页';el.appendChild(hint);\n" +
+		"  if(total>0){ const s=document.createElement('span');s.className='hint';s.textContent='共 '+total+' 条'+(pages>1?(' / '+pages+' 页'):'');el.appendChild(s); }\n" +
 		"  const add=(label,p,active)=>{const b=document.createElement('button');b.textContent=label;b.className=active?'active':'';b.onclick=()=>{goto(p);};el.appendChild(b);};\n" +
-		"  add('‹', Math.max(1,page-1), false);\n" +
-		"  const win=2;\n" +
-		"  for(let p=1;p<=pages;p++){ if(p===1||p===pages||Math.abs(p-page)<=win){ add(p,p,p===page); } else if(Math.abs(p-page)===win+1){ const e=document.createElement('span');e.className='hint';e.textContent='…';el.appendChild(e); } }\n" +
-		"  add('›', Math.min(pages,page+1), false);\n" +
+		"  if(pages>1){\n" +
+		"    add('‹', Math.max(1,page-1), false);\n" +
+		"    const win=2;\n" +
+		"    for(let p=1;p<=pages;p++){ if(p===1||p===pages||Math.abs(p-page)<=win){ add(p,p,p===page); } else if(Math.abs(p-page)===win+1){ const e=document.createElement('span');e.className='hint';e.textContent='…';el.appendChild(e); } }\n" +
+		"    add('›', Math.min(pages,page+1), false);\n" +
+		"  }\n" +
 		"  const sz=document.createElement('select'); sz.onchange=()=>{ const v=parseInt(sz.value,10); if(setsize)setsize(v); goto(1); };\n" +
-		"  [20,50,100,200].forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n+'/页';if(n===size)o.selected=true;sz.appendChild(o);});\n" +
+		"  [10,20,50,100,200].forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n+'/页';if(n===size)o.selected=true;sz.appendChild(o);});\n" +
 		"  sz.style.width='auto'; el.appendChild(sz);\n" +
 		"}\n" +
 		"function esc(s){return (s==null?'':String(s)).replace(/[<>&\"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','\"':'&quot;'}[c]));}\n" +
@@ -235,20 +246,36 @@ func uiJS() string {
 		"function $(id){return document.getElementById(id);}\n" +
 		"function badge(cls, txt){return '<span class=\"badge '+cls+'\">'+txt+'</span>';}\n" +
 		"function statusBadge(s){ if(s==='done')return badge('b-ok','成功'); if(s==='pending')return badge('b-warn','进行中'); if(s==='timeout')return badge('b-warn','超时'); return badge('b-err',s||'失败'); }\n" +
-		"function showLogin(){ $('login').classList.remove('hidden'); $('app').classList.add('hidden'); $('uinfo').innerHTML=''; setTimeout(()=>$('pw').focus(),30); }\n" +
+		"let ROLE='admin';\n" +
+		"function showLogin(){ $('login').classList.remove('hidden'); $('app').classList.add('hidden'); $('uinfo').innerHTML=''; setTimeout(()=>$('lu').focus(),30); }\n" +
 		"async function doLogin(){\n" +
 		"  $('loginErr').textContent='';\n" +
-		"  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:$('pw').value})});\n" +
+		"  const u=$('lu').value||'admin';\n" +
+		"  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:$('pw').value})});\n" +
 		"  const j=await r.json();\n" +
 		"  if(!r.ok){$('loginErr').textContent=j.error||'登录失败';return;}\n" +
-		"  TOK=j.token; localStorage.setItem('gk_tok',TOK); enterApp();\n" +
+		"  TOK=j.token; ROLE=j.role||'admin'; localStorage.setItem('gk_tok',TOK); localStorage.setItem('gk_role',ROLE); enterApp();\n" +
 		"}\n" +
-		"function logout(){ fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+TOK}}); localStorage.removeItem('gk_tok'); TOK=''; showLogin(); }\n" +
+		"function logout(){ fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+TOK}}); localStorage.removeItem('gk_tok'); localStorage.removeItem('gk_role'); TOK=''; ROLE='admin'; showLogin(); }\n" +
 		"async function enterApp(){\n" +
 		"  $('login').classList.add('hidden'); $('app').classList.remove('hidden');\n" +
-		"  $('uinfo').innerHTML='<span class=\"hint\">admin</span><button onclick=\"logout()\">退出</button>';\n" +
+		"  try{ const me=await api('/me'); ROLE=me.role||'admin'; localStorage.setItem('gk_role',ROLE); if(me.version){ const e=$('brandVer'); if(e)e.textContent='v'+me.version+' · 在线账户救援'; } }catch(e){}\n" +
+		"  $('uinfo').innerHTML='<span class=\"hint\">'+esc(ROLE==='admin'?'管理员':ROLE==='operator'?'操作员':'审计员')+'</span><button onclick=\"logout()\">退出</button>';\n" +
+		"  applyRole();\n" +
 		"  try{ await Promise.all([loadAgents(), loadTokens()]); }catch(e){}\n" +
 		"  buildAgentFilters(); connectEvents(); loadAuditActions();\n" +
+		"}\n" +
+		"// 按角色显隐功能 tab / 按钮: admin 全权, operator 不能管 token, auditor 只读审计。\n" +
+		"function applyRole(){\n" +
+		"  const isAdmin = ROLE==='admin';\n" +
+		"  const isAuditor = ROLE==='auditor';\n" +
+		"  // 隐藏 tab 按钮\n" +
+		"  document.querySelectorAll('.tabs button[data-tab]').forEach(b=>{ b.style.display=''; });\n" +
+		"  if(isAuditor){ document.querySelector('.tabs button[data-tab=agents]').style.display='none'; document.querySelector('.tabs button[data-tab=rescue]').style.display='none'; document.querySelector('.tabs button[data-tab=cmd]').style.display='none'; document.querySelector('.tabs button[data-tab=tokens]').style.display='none'; document.querySelector('.tabs button[data-tab=audit]').click(); }\n" +
+		"  else if(!isAdmin){ document.querySelector('.tabs button[data-tab=tokens]').style.display='none'; }\n" +
+		"  // 隐藏按钮级元素(.admin-only / .op-only)\n" +
+		"  document.querySelectorAll('.admin-only').forEach(e=>e.style.display=isAdmin?'':'none');\n" +
+		"  document.querySelectorAll('.op-only').forEach(e=>e.style.display=isAuditor?'none':'');\n" +
 		"}\n" +
 		"async function loadAgents(){\n" +
 		"  const q=($('agentSearch').value||'').trim();\n" +
@@ -405,6 +432,43 @@ func uiJS() string {
 		"async function genToken(){ const r=await api('/tokens','POST',{note:$('tokNote').value, bind_agent_id:$('tokBind').value||''}); $('tokOut').textContent='Token: '+r.token+'\\n备注: '+r.note+(r.bound_agent_id?('\\n绑定: '+r.bound_agent_id):'')+'\\n\\n安装命令:\\n  gatekeeper-agent -server <SERVER> -token '+r.token+'\\n\\n⚠ 此 token 仅显示一次, 请立即保存; 数据库只存哈希。'; toast('已生成, 请立即保存'); tokPage=1; loadTokens(); }\n" +
 		"async function revokeTok(t){ if(!confirm('撤销后该 token 关联的 agent 将被立即踢下线且无法重连, 确定?'))return; await api('/tokens/revoke','POST',{token:t}); toast('已撤销'); loadTokens(); }\n" +
 		"async function deleteTok(t){ if(!confirm('硬删除已撤销的 token? 已绑定 agent 的历史记录会保留但失去对应凭据, 不可恢复, 确定?'))return; const r=await fetch('/api/tokens/delete',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({token:t})}); const j=await r.json(); if(!r.ok){ toast(j.error||'删除失败'); return; } toast('已删除'); loadTokens(); }\n" +
+		"// ---- 用户管理 ----\n" +
+		"async function loadUsers(){\n" +
+		"  if(ROLE!=='admin')return;\n" +
+		"  const r=await api('/users');\n" +
+		"  const tb=$('uBody'); if(!tb)return; tb.innerHTML='';\n" +
+		"  (r||[]).forEach(u=>{\n" +
+		"    const tr=document.createElement('tr');\n" +
+		"    const roleTxt=u.role==='admin'?'管理员':u.role==='operator'?'操作员':'审计员';\n" +
+		"    const status=u.disabled?badge('b-err','已禁用'):badge('b-ok','正常');\n" +
+		"    tr.innerHTML='<td><b>'+esc(u.username)+'</b></td><td>'+badge('b-mut',roleTxt)+'</td><td>'+status+'</td><td class=\"hint\">'+fmtTime(u.created_at)+'</td>'+\n" +
+		"      '<td><div class=\"r\"><button class=\"ghost\" onclick=\"userPwPrompt(\\''+esc(u.username)+'\\')\">改密</button>'+\n" +
+		"      '<button class=\"ghost\" onclick=\"userToggleDisable(\\''+esc(u.username)+'\\','+(!u.disabled)+')\">'+(u.disabled?'启用':'禁用')+'</button>'+\n" +
+		"      '<button class=\"danger\" onclick=\"userDelete(\\''+esc(u.username)+'\\')\">删除</button></div></td>';\n" +
+		"    tb.appendChild(tr);\n" +
+		"  });\n" +
+		"}\n" +
+		"async function createUser(){\n" +
+		"  const u=$('uNewName').value.trim(), pw=$('uNewPw').value, role=$('uNewRole').value;\n" +
+		"  if(!u||!pw){ toast('用户名和口令必填'); return; }\n" +
+		"  const r=await fetch('/api/users',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw,role:role})});\n" +
+		"  const j=await r.json(); if(!r.ok){ toast(j.error||'创建失败'); return; }\n" +
+		"  $('uNewName').value=''; $('uNewPw').value=''; toast('已创建'); loadUsers();\n" +
+		"}\n" +
+		"async function userPwPrompt(u){\n" +
+		"  const pw=prompt('为 '+u+' 设置新口令:'); if(pw===null)return; if(pw.length<6){ toast('口令至少 6 位'); return; }\n" +
+		"  const r=await fetch('/api/users/password',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw})});\n" +
+		"  const j=await r.json(); if(!r.ok){ toast(j.error||'改密失败'); return; } toast('已改密');\n" +
+		"}\n" +
+		"async function userToggleDisable(u,d){\n" +
+		"  const r=await fetch('/api/users/disable',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,disabled:d})});\n" +
+		"  const j=await r.json(); if(!r.ok){ toast(j.error||'操作失败'); return; } toast(d?'已禁用':'已启用'); loadUsers();\n" +
+		"}\n" +
+		"async function userDelete(u){\n" +
+		"  if(!confirm('硬删除用户 '+u+'? 不可恢复, 确定?'))return;\n" +
+		"  const r=await fetch('/api/users/delete',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u})});\n" +
+		"  const j=await r.json(); if(!r.ok){ toast(j.error||'删除失败'); return; } toast('已删除'); loadUsers();\n" +
+		"}\n" +
 		// ---------- 实时事件 ----------
 		"let es;\n" +
 		"function connectEvents(){ if(es)return; try{ es=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ui/events?t='+encodeURIComponent(TOK)); es.onmessage=ev=>{ let m; try{m=JSON.parse(ev.data);}catch(e){return;} if(m.type==='result'||m.type==='agent_online'||m.type==='agent_offline'){ loadAgents(); loadCmds(); } }; es.onclose=()=>{ es=null; setTimeout(connectEvents,3000); }; }catch(e){} }\n" +
@@ -418,8 +482,9 @@ func uiJS() string {
 		"  if(b.dataset.tab==='audit')loadAudit();\n" +
 		"  if(b.dataset.tab==='tokens')loadTokens();\n" +
 		"  if(b.dataset.tab==='rescue')refreshRescueSelect();\n" +
+		"  if(b.dataset.tab==='users')loadUsers();\n" +
 		"});\n" +
 		// ---------- 启动 ----------
-		"if(TOK){ fetch('/api/me',{headers:{'Authorization':'Bearer '+TOK}}).then(r=>{if(!r.ok){showLogin();}else enterApp();}).catch(showLogin); } else { showLogin(); }\n" +
+		"if(TOK){ ROLE=localStorage.getItem('gk_role')||'admin'; fetch('/api/me',{headers:{'Authorization':'Bearer '+TOK}}).then(r=>{if(!r.ok){showLogin();}else enterApp();}).catch(showLogin); } else { showLogin(); }\n" +
 		"onActChange();\n"
 }

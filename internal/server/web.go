@@ -13,6 +13,7 @@ import (
 
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/proto"
+	"gatekeeper/internal/version"
 )
 
 // ---- 登录限速 ----
@@ -106,6 +107,17 @@ func loginOK(ip string) {
 type AuthCtx struct {
 	Actor string
 	IP    string
+	Role  string // admin / operator / auditor; 旧 session 无 role 时默认 admin 以兼容
+}
+
+// HasRole 返回当前用户是否拥有任一指定角色。
+func (ac AuthCtx) HasRole(roles ...string) bool {
+	for _, r := range roles {
+		if ac.Role == r {
+			return true
+		}
+	}
+	return false
 }
 
 // Mux 返回带 API + Web UI 的 mux。允许 query token 访问受 ui.AllowQueryToken 控制。
@@ -156,48 +168,52 @@ func (s *Server) authCheck(w http.ResponseWriter, r *http.Request, cfg config.Se
 	// 1) Authorization: Bearer <session>
 	if a := get("Authorization"); strings.HasPrefix(a, "Bearer ") {
 		tok := strings.TrimPrefix(a, "Bearer ")
-		if actor, ok := s.checkSession(tok); ok {
-			return AuthCtx{Actor: actor, IP: s.clientIP(r)}, true
+		if actor, role, ok := s.checkSession(tok); ok {
+			return AuthCtx{Actor: actor, Role: role, IP: s.clientIP(r)}, true
 		}
 	}
-	// 2) query ?t=<token>  (AllowQueryToken 或 login 接口放行)
+	// 2) query ?t=<token>  (AllowQueryToken)
 	if q := r.URL.Query().Get("t"); q != "" {
-		if actor, ok := s.checkSession(q); ok {
-			return AuthCtx{Actor: actor, IP: s.clientIP(r)}, true
+		if actor, role, ok := s.checkSession(q); ok {
+			return AuthCtx{Actor: actor, Role: role, IP: s.clientIP(r)}, true
 		}
 		if cfg.UI.AllowQueryToken && q == cfg.UI.AdminPassword {
-			return AuthCtx{Actor: "admin", IP: s.clientIP(r)}, true
+			return AuthCtx{Actor: "admin", Role: "admin", IP: s.clientIP(r)}, true
 		}
 	}
 	// 3) 特例：登录接口必须放行
 	if r.URL.Path == "/api/login" {
-		return AuthCtx{Actor: "anonymous", IP: s.clientIP(r)}, true
+		return AuthCtx{Actor: "anonymous", Role: "anonymous", IP: s.clientIP(r)}, true
 	}
 	w.Header().Set("WWW-Authenticate", `Bearer realm="gatekeeper"`)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 	return AuthCtx{}, false
 }
 
-// checkSession 校验会话 token 是否有效并返回 actor。
-func (s *Server) checkSession(tok string) (string, bool) {
+// checkSession 校验会话 token 是否有效, 返回 (username, role, ok)。
+// session 值格式: username|role|expiresUnix
+func (s *Server) checkSession(tok string) (string, string, bool) {
 	v, err := s.Store.SettingGet("session:" + tok)
 	if err != nil || v == "" {
-		return "", false
+		return "", "", false
 	}
-	// v 格式：actor|expiresUnix
-	parts := strings.SplitN(v, "|", 2)
-	if len(parts) != 2 {
-		return "", false
+	parts := strings.SplitN(v, "|", 3)
+	if len(parts) < 2 {
+		return "", "", false
 	}
-	ts, err := strconv.ParseInt(parts[1], 10, 64)
+	role := "admin" // 兼容老 session "actor|expires" 两段格式
+	if len(parts) == 3 {
+		role = parts[1]
+	}
+	ts, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	if time.Now().Unix() > ts {
 		_ = s.Store.SettingSet("session:"+tok, "")
-		return "", false
+		return "", "", false
 	}
-	return parts[0], true
+	return parts[0], role, true
 }
 
 // 便捷别名
@@ -234,17 +250,37 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 		s.handleLogout(w, r)
 	case path == "/api/me" && r.Method == http.MethodGet:
 		ac := actorOf(r)
-		respond(w, map[string]string{"actor": ac.Actor}, nil)
+		respond(w, map[string]string{"actor": ac.Actor, "role": ac.Role, "version": version.String()}, nil)
 	case path == "/api/agents" && r.Method == http.MethodGet:
 		page := atoiDefault(r.URL.Query().Get("page"), 1)
-		pageSize := atoiDefault(r.URL.Query().Get("page_size"), 200)
+		pageSize := atoiDefault(r.URL.Query().Get("page_size"), 10)
 		q := r.URL.Query().Get("q")
 		agents, total, err := s.Store.ListAgentsPaged(page, pageSize, q)
+		// 叠加 live session 在线真值: DB online 列由 sweeper 维护(15s 滞后),
+		// 此处以 server 内存中的活跃会话为准, 给前端最实时的在线状态。
+		if err == nil {
+			for i := range agents {
+				if agents[i].Online {
+					// DB 标在线但 live session 不在 -> 实际已失联, 修正为 false
+					if !s.IsOnline(agents[i].AgentID) {
+						agents[i].Online = false
+					}
+				}
+				// live session 在 -> 一定在线, 不论 DB 怎么标
+				if s.IsOnline(agents[i].AgentID) {
+					agents[i].Online = true
+				}
+			}
+		}
 		respond(w, pagedResult(agents, total, page, pageSize), err)
 	case path == "/api/agents" && r.Method == http.MethodPost:
 		s.handleAgentUpdate(w, r)
 	case path == "/api/agents" && r.Method == http.MethodDelete:
-		// 删除 agent：?id=xxx  (硬删除, 仅允许离线 agent)
+		// 删除 agent：?id=xxx  (硬删除, 仅允许离线 agent; 仅 admin)
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
 		s.handleAgentDelete(w, r)
 	case strings.HasPrefix(path, "/api/agent/") && r.Method == http.MethodGet:
 		s.handleAgentGet(w, r)
@@ -253,12 +289,12 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/commands" && r.Method == http.MethodGet:
 		agentID := r.URL.Query().Get("agent_id")
 		page := atoiDefault(r.URL.Query().Get("page"), 1)
-		pageSize := atoiDefault(r.URL.Query().Get("page_size"), 200)
+		pageSize := atoiDefault(r.URL.Query().Get("page_size"), 10)
 		cmds, total, err := s.Store.ListCmdsPaged(page, pageSize, agentID)
 		respond(w, pagedResult(cmds, total, page, pageSize), err)
 	case path == "/api/tokens" && r.Method == http.MethodGet:
 		page := atoiDefault(r.URL.Query().Get("page"), 1)
-		pageSize := atoiDefault(r.URL.Query().Get("page_size"), 200)
+		pageSize := atoiDefault(r.URL.Query().Get("page_size"), 10)
 		toks, total, err := s.Store.ListTokensPaged(page, pageSize)
 		// 用 agent_id 反查 hostname, 供 UI 直接显示绑定主机名
 		for i := range toks {
@@ -268,21 +304,45 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 		}
 		respond(w, pagedResult(toks, total, page, pageSize), err)
 	case path == "/api/tokens" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
 		s.handleTokenCreate(w, r)
 	case path == "/api/tokens/revoke" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
 		s.handleTokenRevoke(w, r)
 	case path == "/api/tokens/delete" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
 		s.handleTokenDelete(w, r)
 	case path == "/api/tokens/bind" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
 		s.handleTokenBind(w, r)
 	case path == "/api/dispatch" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin", "operator") {
+			forbidden(w, r)
+			return
+		}
 		s.handleDispatch(w, r)
 	case path == "/api/dispatch_batch" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin", "operator") {
+			forbidden(w, r)
+			return
+		}
 		s.handleDispatchBatch(w, r)
 	case path == "/api/audit" && r.Method == http.MethodGet:
 		f := AuditFilter{
 			Page:     atoiDefault(r.URL.Query().Get("page"), 1),
-			PageSize: atoiDefault(r.URL.Query().Get("page_size"), 200),
+			PageSize: atoiDefault(r.URL.Query().Get("page_size"), 10),
 		}
 		f.Actor = r.URL.Query().Get("actor")
 		f.Action = r.URL.Query().Get("action")
@@ -299,6 +359,49 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 		s.handleCmdStatus(w, r)
 	case path == "/api/settings" && r.Method == http.MethodGet:
 		respond(w, map[string]any{"allow_query_token": false}, nil)
+	case path == "/api/settings/retention" && r.Method == http.MethodGet:
+		min := s.retentionMinDays
+		v, _ := s.Store.SettingGet("audit_retention_days")
+		days := min
+		if v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= min {
+				days = n
+			}
+		}
+		respond(w, map[string]any{
+			"min_days":     min, // YAML 下限, UI 不允许低于
+			"current_days": days,
+		}, nil)
+	case path == "/api/settings/retention" && r.Method == http.MethodPost:
+		ac := actorOf(r)
+		if !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
+		var body struct {
+			Days int `json:"days"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		min := s.retentionMinDays
+		if body.Days < min {
+			http.Error(w, fmt.Sprintf("retention days must >= %d (yaml floor)", min), http.StatusBadRequest)
+			return
+		}
+		_ = s.Store.SettingSet("audit_retention_days", strconv.Itoa(body.Days))
+		s.Store.Audit(ac.Actor, "retention_set", "", fmt.Sprintf("days=%d", body.Days), ac.IP)
+		respond(w, map[string]int{"days": body.Days}, nil)
+	case path == "/api/users" && r.Method == http.MethodGet:
+		s.handleUsersList(w, r)
+	case path == "/api/users" && r.Method == http.MethodPost:
+		s.handleUserCreate(w, r)
+	case path == "/api/users/password" && r.Method == http.MethodPost:
+		s.handleUserPassword(w, r)
+	case path == "/api/users/disable" && r.Method == http.MethodPost:
+		s.handleUserDisable(w, r)
+	case path == "/api/users/delete" && r.Method == http.MethodPost:
+		s.handleUserDelete(w, r)
+	case path == "/api/alerts/test" && r.Method == http.MethodPost:
+		s.handleAlertTest(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -322,6 +425,184 @@ func pagedResult(items any, total, page, pageSize int) map[string]any {
 	}
 }
 
+// forbidden 返回 403, 用于 RBAC 校验失败。
+func forbidden(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "forbidden: insufficient role", http.StatusForbidden)
+}
+
+// ---- 用户管理 handlers ----
+
+func (s *Server) handleUsersList(w http.ResponseWriter, r *http.Request) {
+	ac := actorOf(r)
+	if !ac.HasRole("admin") {
+		forbidden(w, r)
+		return
+	}
+	users, err := s.Store.ListUsers()
+	respond(w, users, err)
+}
+
+func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
+	ac := actorOf(r)
+	if !ac.HasRole("admin") {
+		forbidden(w, r)
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Username == "" || body.Password == "" {
+		http.Error(w, "username and password required", http.StatusBadRequest)
+		return
+	}
+	if body.Role == "" {
+		body.Role = "operator"
+	}
+	if body.Role != "admin" && body.Role != "operator" && body.Role != "auditor" {
+		http.Error(w, "role must be admin/operator/auditor", http.StatusBadRequest)
+		return
+	}
+	h, err := HashPassword(body.Password)
+	if err != nil {
+		http.Error(w, "hash error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.Store.CreateUser(body.Username, h, body.Role); err != nil {
+		http.Error(w, "create failed (username may already exist)", http.StatusConflict)
+		return
+	}
+	s.Store.Audit(ac.Actor, "user_create", body.Username, "role="+body.Role, ac.IP)
+	respond(w, map[string]string{"username": body.Username, "role": body.Role}, nil)
+}
+
+func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
+	ac := actorOf(r)
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	// 自助改密 OR admin 改任意; 但 auditor 不允许改别人
+	if ac.Actor != body.Username && !ac.HasRole("admin") {
+		forbidden(w, r)
+		return
+	}
+	if body.Username == "" || body.Password == "" {
+		http.Error(w, "username and password required", http.StatusBadRequest)
+		return
+	}
+	h, err := HashPassword(body.Password)
+	if err != nil {
+		http.Error(w, "hash error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.Store.SetUserPassword(body.Username, h); err != nil {
+		respond(w, nil, err)
+		return
+	}
+	s.Store.Audit(ac.Actor, "user_password_change", body.Username, "", ac.IP)
+	respond(w, map[string]string{"status": "ok"}, nil)
+}
+
+func (s *Server) handleUserDisable(w http.ResponseWriter, r *http.Request) {
+	ac := actorOf(r)
+	if !ac.HasRole("admin") {
+		forbidden(w, r)
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Disabled bool   `json:"disabled"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Username == "" {
+		http.Error(w, "username required", http.StatusBadRequest)
+		return
+	}
+	// 防止禁用最后一个 admin
+	if body.Disabled && body.Username == ac.Actor {
+		if n, _ := s.Store.CountAdmins(); n <= 1 {
+			http.Error(w, "refuse: cannot disable the last admin (yourself)", http.StatusConflict)
+			return
+		}
+	}
+	if err := s.Store.SetUserDisabled(body.Username, body.Disabled); err != nil {
+		respond(w, nil, err)
+		return
+	}
+	s.Store.Audit(ac.Actor, "user_disable", body.Username, fmt.Sprintf("disabled=%v", body.Disabled), ac.IP)
+	respond(w, map[string]bool{"disabled": body.Disabled}, nil)
+}
+
+func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request) {
+	ac := actorOf(r)
+	if !ac.HasRole("admin") {
+		forbidden(w, r)
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Username == "" {
+		http.Error(w, "username required", http.StatusBadRequest)
+		return
+	}
+	if body.Username == ac.Actor {
+		http.Error(w, "refuse: cannot delete yourself", http.StatusConflict)
+		return
+	}
+	u, _, _ := s.Store.GetUser(body.Username)
+	if u != nil && u.Role == "admin" {
+		if n, _ := s.Store.CountAdmins(); n <= 1 {
+			http.Error(w, "refuse: cannot delete the last admin", http.StatusConflict)
+			return
+		}
+	}
+	if err := s.Store.DeleteUser(body.Username); err != nil {
+		respond(w, nil, err)
+		return
+	}
+	s.Store.Audit(ac.Actor, "user_delete", body.Username, "hard delete", ac.IP)
+	respond(w, map[string]string{"status": "ok"}, nil)
+}
+
+// handleAlertTest 手动触发一次告警测试, 用于验证 webhook 配置是否生效。
+// 仅 admin 可调。请求体: {"agent_id":"xxx"} (可选, 缺省取第一个 agent)。
+func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
+	ac := actorOf(r)
+	if !ac.HasRole("admin") {
+		forbidden(w, r)
+		return
+	}
+	if s.alert == nil {
+		http.Error(w, "告警未启用 (配置 alerts.enabled=false 或 webhook_url 为空)", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		AgentID string `json:"agent_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.AgentID == "" {
+		// 取第一个 agent
+		ags, _, _ := s.Store.ListAgentsPaged(1, 1, "")
+		if len(ags) == 0 {
+			http.Error(w, "没有任何已注册 agent, 无法测试", http.StatusBadRequest)
+			return
+		}
+		body.AgentID = ags[0].AgentID
+	}
+	if err := s.alert.ForceAlert(body.AgentID); err != nil {
+		http.Error(w, "告警发送失败: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	s.Store.Audit(ac.Actor, "alert_test", body.AgentID, "手动触发 webhook 测试", ac.IP)
+	respond(w, map[string]string{"status": "sent", "agent_id": body.AgentID}, nil)
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	if !loginAllowed(ip) {
@@ -330,31 +611,47 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
+		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	hashed, _ := s.Store.SettingGet("admin_password")
-	if hashed == "" {
-		http.Error(w, "admin password not initialized", http.StatusInternalServerError)
+	// 兼容旧客户端: 身份缺省时回退为 admin
+	if body.Username == "" {
+		body.Username = "admin"
+	}
+	u, hash, err := s.Store.GetUser(body.Username)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if !CheckPassword(hashed, body.Password) {
+	if u == nil || hash == "" || u.Disabled {
 		cool := loginFail(ip)
-		s.Store.Audit("anonymous", "login_failed", "", "ip="+ip, ip)
+		s.Store.Audit(body.Username, "login_failed", "", "reason=user_not_found_or_disabled ip="+ip, ip)
 		w.WriteHeader(http.StatusUnauthorized)
 		if cool > 0 {
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid password", "cooldown": intToStr(int64(cool))})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials", "cooldown": intToStr(int64(cool))})
 		} else {
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid password"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials"})
+		}
+		return
+	}
+	if !CheckPassword(hash, body.Password) {
+		cool := loginFail(ip)
+		s.Store.Audit(body.Username, "login_failed", "", "ip="+ip, ip)
+		w.WriteHeader(http.StatusUnauthorized)
+		if cool > 0 {
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials", "cooldown": intToStr(int64(cool))})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials"})
 		}
 		return
 	}
 	loginOK(ip)
 	tok := genSession()
 	expires := time.Now().Add(12 * time.Hour).Unix()
-	_ = s.Store.SettingSet("session:"+tok, "admin|"+intToStr(expires))
-	s.Store.Audit("admin", "login", "", "session="+tok, ip)
-	respond(w, map[string]string{"token": tok, "actor": "admin", "expires_at": intToStr(expires)}, nil)
+	_ = s.Store.SettingSet("session:"+tok, body.Username+"|"+u.Role+"|"+intToStr(expires))
+	s.Store.Audit(body.Username, "login", "", "session="+tok, ip)
+	respond(w, map[string]string{"token": tok, "actor": body.Username, "role": u.Role, "expires_at": intToStr(expires)}, nil)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {

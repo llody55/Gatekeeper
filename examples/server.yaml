@@ -51,5 +51,23 @@ trusted_proxies: []
 defaults:
   # 单条指令未回执的超时，超时自动标记 timeout。默认 60s。
   cmd_timeout: "60s"
-  # 历史指令保留时长(留空=永久)。后续会做自动清理。
-  history_retention: "720h"  # 30 天
+  # 历史指令保留时长(作为"等保下限"锁): 默认 180 天, DB settings.audit_retention_days
+  # 可在 UI 热调提高但不得低于此值。此为合规下限, 不可被运维绕过。
+  # 留空(=0)时下限仍按 180 天兜底。
+  history_retention: "4320h"  # 180 天
+
+# agent 健康告警。当某 agent 超过 offline_after 未心跳时, 向 webhook_url POST
+# 一次 JSON 事件(event=agent_offline); 该 agent 恢复心跳后, 再 POST 一次
+# agent_recovered 事件。同一 agent 同一状态去重, 不会每次扫描都重复发。
+# 测试: 登录后在后台 /api/alerts/test 可手动触发一次(仅 admin)。
+alerts:
+  # 是否启用。false 或 webhook_url 留空则完全不启用(默认)。
+  enabled: false
+  # 多久未心跳触发告警, 默认 10 分钟。
+  offline_after: "10m"
+  # 扫描周期, 默认 60s。
+  check_interval: "60s"
+  # 目标 URL, POST JSON。示例为钉钉机器人风格(请按实际情况替换)。
+  webhook_url: ""
+  # 可选, 写入 X-Gatekeeper-Token 头, 用于校验请求来源。
+  webhook_token: ""

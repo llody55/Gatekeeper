@@ -76,10 +76,20 @@ CREATE TABLE IF NOT EXISTS audit_log (
   ip            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_actor_action_ts ON audit_log(actor, action, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target);
 CREATE TABLE IF NOT EXISTS settings (
   k             TEXT PRIMARY KEY,
   v             TEXT NOT NULL,
   updated_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS users (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  username      TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL DEFAULT 'operator', -- admin / operator / auditor
+  created_at    INTEGER NOT NULL,
+  disabled      INTEGER NOT NULL DEFAULT 0
 );
 `)
 	if err != nil {
@@ -334,6 +344,87 @@ func (s *Store) OfflineAgent(agentID string) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`UPDATE agents SET online=0 WHERE agent_id=?`, agentID)
 	return err
+}
+
+// GetAgentByID 按 agent_id 取一行, 不存在返回 (nil, nil)。
+func (s *Store) GetAgentByID(agentID string) (*AgentRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var a AgentRow
+	var ls sql.NullInt64
+	var tags sql.NullString
+	err := s.db.QueryRow(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE agent_id=?`, agentID).
+		Scan(&a.AgentID, &a.Hostname, &a.IP, &a.Online, &ls, &tags)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ls.Valid {
+		a.LastSeen = time.Unix(ls.Int64, 0)
+	}
+	if tags.Valid && tags.String != "" {
+		a.Tags = strings.Split(tags.String, ",")
+	}
+	return &a, nil
+}
+
+// ListAgentsStale 返回 last_seen 早于 cutoff 的 agent(不论 online 列), 用于告警扫描。
+// audit_log 路径不调用此函数; 仅 alert checker 用。
+func (s *Store) ListAgentsStale(cutoff time.Time) ([]AgentRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE last_seen < ?`, cutoff.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AgentRow
+	for rows.Next() {
+		var a AgentRow
+		var ls sql.NullInt64
+		var tags sql.NullString
+		if err := rows.Scan(&a.AgentID, &a.Hostname, &a.IP, &a.Online, &ls, &tags); err != nil {
+			return nil, err
+		}
+		if ls.Valid {
+			a.LastSeen = time.Unix(ls.Int64, 0)
+		}
+		if tags.Valid && tags.String != "" {
+			a.Tags = strings.Split(tags.String, ",")
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListAgentsSeenSince 返回 last_seen >= since 的 agent, 用于告警恢复扫描。
+func (s *Store) ListAgentsSeenSince(since time.Time) ([]AgentRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE last_seen >= ?`, since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AgentRow
+	for rows.Next() {
+		var a AgentRow
+		var ls sql.NullInt64
+		var tags sql.NullString
+		if err := rows.Scan(&a.AgentID, &a.Hostname, &a.IP, &a.Online, &ls, &tags); err != nil {
+			return nil, err
+		}
+		if ls.Valid {
+			a.LastSeen = time.Unix(ls.Int64, 0)
+		}
+		if tags.Valid && tags.String != "" {
+			a.Tags = strings.Split(tags.String, ",")
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // SweepStaleAgents 把 last_seen 超过 timeout 仍标记 online=1 的 agent 置离线，
@@ -749,6 +840,130 @@ func (s *Store) SettingSet(k, v string) error {
 		ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at`,
 		k, v, time.Now().Unix())
 	return err
+}
+
+// ---- 用户与 RBAC ----
+
+// UserRow 描述一个管理端用户(admin/operator/auditor)。
+type UserRow struct {
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	Disabled  bool   `json:"disabled"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// CreateUser 创建用户; username 唯一, password 已被 bcrypt 哈希。
+func (s *Store) CreateUser(username, passwordHash, role string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if role == "" {
+		role = "operator"
+	}
+	_, err := s.db.Exec(`INSERT INTO users(username, password_hash, role, created_at) VALUES(?,?,?,?)`,
+		username, passwordHash, role, time.Now().Unix())
+	return err
+}
+
+// GetUser 按 username 取一个用户(含 password_hash)。
+func (s *Store) GetUser(username string) (*UserRow, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var u UserRow
+	var created int64
+	var disabled int
+	var hash string
+	err := s.db.QueryRow(`SELECT id, username, password_hash, role, created_at, disabled FROM users WHERE username=?`, username).
+		Scan(&u.ID, &u.Username, &hash, &u.Role, &created, &disabled)
+	if err == sql.ErrNoRows {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	u.Disabled = disabled == 1
+	u.CreatedAt = created
+	return &u, hash, nil
+}
+
+// ListUsers 列出所有用户(不含 password_hash)。
+func (s *Store) ListUsers() ([]UserRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT id, username, role, created_at, disabled FROM users ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserRow
+	for rows.Next() {
+		var u UserRow
+		var created int64
+		var disabled int
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &created, &disabled); err != nil {
+			return nil, err
+		}
+		u.Disabled = disabled == 1
+		u.CreatedAt = created
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// SetUserPassword 更新某用户口令哈希。
+func (s *Store) SetUserPassword(username, passwordHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE users SET password_hash=? WHERE username=?`, passwordHash, username)
+	return err
+}
+
+// SetUserDisabled 启用/禁用某用户。
+func (s *Store) SetUserDisabled(username string, disabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := 0
+	if disabled {
+		d = 1
+	}
+	_, err := s.db.Exec(`UPDATE users SET disabled=? WHERE username=?`, d, username)
+	return err
+}
+
+// DeleteUser 硬删除用户。
+func (s *Store) DeleteUser(username string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM users WHERE username=?`, username)
+	return err
+}
+
+// CountAdmins 返回未禁用的 admin 用户数(用于防止删除最后一个 admin)。
+func (s *Store) CountAdmins() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role='admin' AND disabled=0`).Scan(&n)
+	return n, err
+}
+
+// PurgeOlderThan 删除 audit_log/commands 中早于 cutoff 的记录, 返回各自删除条数。
+// 用于实现 history_retention 双层下限锁: 由 caller 计算最终 cutoff 后调用。
+func (s *Store) PurgeOlderThan(cutoff time.Time) (auditRows, cmdRows int64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := cutoff.Unix()
+	r, e := s.db.Exec(`DELETE FROM audit_log WHERE ts < ?`, c)
+	if e != nil {
+		return 0, 0, e
+	}
+	auditRows, _ = r.RowsAffected()
+	r, e = s.db.Exec(`DELETE FROM commands WHERE created_at < ?`, c)
+	if e != nil {
+		return auditRows, 0, e
+	}
+	cmdRows, _ = r.RowsAffected()
+	return auditRows, cmdRows, nil
 }
 
 func boolStatus(ok bool) string {

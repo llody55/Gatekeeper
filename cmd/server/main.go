@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/server"
+	"gatekeeper/internal/version"
 )
 
 func main() {
@@ -28,7 +30,7 @@ func main() {
 	if *addr != "" {
 		cfg.Listen = *addr
 	}
-	log.Printf("[gatekeeper-server] 配置加载完成: listen=%s db=%s", cfg.Listen, cfg.DBPath)
+	log.Printf("[gatekeeper-server] v%s 配置加载完成: listen=%s db=%s", version.String(), cfg.Listen, cfg.DBPath)
 
 	store, err := server.Open(cfg.DBPath)
 	if err != nil {
@@ -36,25 +38,38 @@ func main() {
 	}
 	defer store.Close()
 
-	// 初始化 admin_password：以 bcrypt 哈希存入 DB，明文绝不入库。
-	storedHash, _ := store.SettingGet("admin_password")
+	// 初始化 admin 用户(多账号体系): 迁移老 settings.admin_password 到 users 表。
+	adminHash, _ := store.SettingGet("admin_password")
 	if cfg.UI.AdminPassword != "" {
-		// 配置文件显式给了明文 -> 哈希后覆盖入库。明文不回写 cfg 用于鉴权。
+		// 配置文件显式给了明文 -> 给 admin 用户覆盖口令哈希。
 		if h, err := server.HashPassword(cfg.UI.AdminPassword); err == nil {
-			_ = store.SettingSet("admin_password", h)
+			adminHash = h
+			_ = store.SettingSet("admin_password", h) // 保留旧 settings 行做兼容
 			log.Printf("[security] 已用配置中的 admin_password 重新哈希落库")
 		}
-		// 配置明文同时可以用于 AllowQueryToken 路径(默认关闭, 仅内网便捷)
-	} else if storedHash == "" {
-		// 首次启动且未配置: 生成随机明文, 哈希落库, 明文仅打印一次。
-		plain := randomHex(8)
-		if h, err := server.HashPassword(plain); err == nil {
-			_ = store.SettingSet("admin_password", h)
-			log.Printf("[security] 首次启动，已自动生成管理员口令(请妥善保存, 仅显示一次): %s", plain)
+	}
+	// 若 users 表无 admin 用户, 则创建一个(role=admin)。
+	if u, _, _ := store.GetUser("admin"); u == nil {
+		if adminHash == "" {
+			// 首次启动且未配置: 生成随机明文, 哈希落库, 明文仅打印一次。
+			plain := randomHex(8)
+			if h, err := server.HashPassword(plain); err == nil {
+				adminHash = h
+				_ = store.SettingSet("admin_password", h)
+				log.Printf("[security] 首次启动，已自动生成 admin 口令(请妥善保存, 仅显示一次): %s", plain)
+			}
+		} else {
+			log.Printf("[security] 已从老 settings.admin_password 迁移到 users 表")
 		}
-		// 不将明文写回 cfg；用户后续登录靠该明文，遗失需按 CONFIG.md 流程重置。
+		if err := store.CreateUser("admin", adminHash, "admin"); err != nil {
+			log.Printf("[security] 创建 admin 用户失败: %v", err)
+		}
+	} else if cfg.UI.AdminPassword != "" {
+		// admin 已存在但配置给了新明文: 同步覆盖口令
+		_ = store.SetUserPassword("admin", adminHash)
+		log.Printf("[security] 已用配置中的 admin_password 更新 admin 用户口令")
 	} else {
-		log.Printf("[security] 使用数据库中已有 admin 口令哈希; 若需重置请按 CONFIG.md 操作")
+		log.Printf("[security] 使用 users 表中已有 admin 账号; 若需重置请登录后到用户管理页或修改 server.yaml")
 	}
 
 	// 处理 agent token
@@ -68,7 +83,14 @@ func main() {
 		log.Printf("[bootstrap] 首次启动无任何 agent token，已自动生成: %s", t)
 	}
 
-	srv := server.New(store, cfg.TrustedProxies, cfg.Agent.BindBootstrapToken)
+	// agent 健康告警检查器: 可配置 webhook, 超时未心跳触发
+	alertCh := make(chan struct{})
+	alertChecker := server.NewAlertChecker(store, cfg.Alerts)
+	go alertChecker.Run(alertCh)
+
+	srv := server.New(store, cfg.TrustedProxies, cfg.Agent.BindBootstrapToken,
+		int(cfg.Defaults.HistoryRetention/(24*time.Hour)))
+	srv.SetAlerter(alertChecker)
 	if len(cfg.TrustedProxies) == 0 {
 		log.Printf("[security] 未配置 trusted_proxies, 将忽略所有 X-Forwarded-For, 使用直连 IP 做登录限速(公网部署推荐)")
 	} else {
@@ -82,6 +104,8 @@ func main() {
 	go runTimeoutSweeper(srv, store, cfg.Defaults.CmdTimeout)
 	// 在线状态扫描器：心跳超时则判定离线，弥补 agent 没有 TCP FIN 就掉线的假在线
 	go runHeartbeatSweeper(store, cfg.Agent.HeartbeatTimeout)
+	// 数据留存清理器：每日跑一次, 按 DB settings 与 YAML 下限取较大值(更严格)
+	go runRetentionWorker(store, cfg.Defaults.HistoryRetention)
 
 	hs := &http.Server{
 		Addr:              cfg.Listen,
@@ -133,4 +157,47 @@ func randomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// runRetentionWorker 每日按"DB settings -> YAML 下限"取较严格(较大)保留天数清理旧数据。
+// DB setting 缺省回落到 YAML history_retention; DB 设置不得低于 YAML 下限(否则按下限执行)。
+func runRetentionWorker(store *server.Store, yamlMin time.Duration) {
+	minDays := int(yamlMin / (24 * time.Hour))
+	if minDays < 1 {
+		minDays = 180
+	}
+	// 启动后等 30s 再跑第一次, 避免与启动初始化抢锁
+	time.Sleep(30 * time.Second)
+	run := func() {
+		days := resolveRetentionDays(store, minDays)
+		cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+		a, c, err := store.PurgeOlderThan(cutoff)
+		if err != nil {
+			log.Printf("[retention] 清理失败: %v", err)
+			return
+		}
+		if a > 0 || c > 0 {
+			log.Printf("[retention] 已清理 audit=%d commands=%d (保留 %d 天, 下限 %d 天)", a, c, days, minDays)
+		}
+	}
+	run()
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for range t.C {
+		run()
+	}
+}
+
+// resolveRetentionDays 解析 DB settings 中的 audit_retention_days,
+// 若未设或小于下限则按下限返回。
+func resolveRetentionDays(store *server.Store, minDays int) int {
+	v, _ := store.SettingGet("audit_retention_days")
+	if v == "" {
+		return minDays
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < minDays {
+		return minDays
+	}
+	return n
 }

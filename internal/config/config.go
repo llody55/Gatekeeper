@@ -37,6 +37,18 @@ type ServerConfig struct {
 	Agent          AgentPolicy   `yaml:"agent"`
 	Defaults       DefaultPolicy `yaml:"defaults"`
 	TrustedProxies []string      `yaml:"trusted_proxies"` // 信任的前置代理 CIDR 列表；仅当直连对端 IP 命中此列表时方解析 X-Forwarded-For。默认空=不信任任何 XFF，公网部署必须留空
+	Alerts         AlertConfig   `yaml:"alerts"`          // agent 健康告警配置
+}
+
+// AlertConfig agent 健康告警配置。
+// 触发条件: agent 超过 OfflineAfter 未心跳 -> POST 一次 webhook。
+// 恢复后再次心跳 -> POST restore 事件。同一 agent 同一状态去重, 不重复发。
+type AlertConfig struct {
+	Enabled       bool          `yaml:"enabled"`        // 是否启用告警
+	OfflineAfter  time.Duration `yaml:"offline_after"`  // 多久未心跳触发告警, 默认 10 分钟
+	WebhookURL    string        `yaml:"webhook_url"`    // 目标 URL, POST JSON
+	WebhookToken  string        `yaml:"webhook_token"`  // 可选, 写入 X-Gatekeeper-Token 头
+	CheckInterval time.Duration `yaml:"check_interval"` // 检查周期, 默认 60s
 }
 
 // TLSConfig TLS 配置。
@@ -106,7 +118,11 @@ func DefaultServer() ServerConfig {
 		},
 		Defaults: DefaultPolicy{
 			CmdTimeout:       60 * time.Second,
-			HistoryRetention: 30 * 24 * time.Hour,
+			HistoryRetention: 180 * 24 * time.Hour, // 等保常见要求日志留存 >=6 个月, 此为下限, DB 设置不得低于此值
+		},
+		Alerts: AlertConfig{
+			OfflineAfter:  10 * time.Minute,
+			CheckInterval: 60 * time.Second,
 		},
 	}
 }

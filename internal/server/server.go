@@ -22,14 +22,16 @@ type Server struct {
 	mu                 sync.RWMutex
 	sessions           map[string]*Session // agent_id -> 会话
 	uiHub              *UIHub
-	trustedProxies     []*net.IPNet // 解析后的可信代理 CIDR；为空表示不信任任何 XFF
-	bindBootstrapToken bool         // 是否把首次被注册的 bootstrap token 自动绑定到该 agent_id
+	trustedProxies     []*net.IPNet  // 解析后的可信代理 CIDR；为空表示不信任任何 XFF
+	bindBootstrapToken bool          // 是否把首次被注册的 bootstrap token 自动绑定到该 agent_id
+	retentionMinDays   int           // YAML 配置的留存下限天数, UI/DB 不得低于此值
+	alert              *AlertChecker // agent 健康告警检查器; 可能为 nil
 }
 
 // New 构造 Server；trustedProxies 为 CIDR 字符串列表，"any" 表示信任所有。
-func New(s *Store, trustedProxies []string, bindBootstrapToken bool) *Server {
+func New(s *Store, trustedProxies []string, bindBootstrapToken bool, retentionMinDays int) *Server {
 	srv := &Server{Store: s, sessions: map[string]*Session{}, uiHub: newUIHub(),
-		bindBootstrapToken: bindBootstrapToken}
+		bindBootstrapToken: bindBootstrapToken, retentionMinDays: retentionMinDays}
 	for _, c := range trustedProxies {
 		c = strings.TrimSpace(c)
 		if c == "" {
@@ -51,6 +53,9 @@ func New(s *Store, trustedProxies []string, bindBootstrapToken bool) *Server {
 	}
 	return srv
 }
+
+// SetAlerter 注入告警检查器, 供 /api/alerts/test 等路由调用。
+func (s *Server) SetAlerter(a *AlertChecker) { s.alert = a }
 
 type Session struct {
 	AgentID string
