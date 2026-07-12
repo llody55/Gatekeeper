@@ -38,6 +38,16 @@ type ServerConfig struct {
 	Defaults       DefaultPolicy `yaml:"defaults"`
 	TrustedProxies []string      `yaml:"trusted_proxies"` // 信任的前置代理 CIDR 列表；仅当直连对端 IP 命中此列表时方解析 X-Forwarded-For。默认空=不信任任何 XFF，公网部署必须留空
 	Alerts         AlertConfig   `yaml:"alerts"`          // agent 健康告警配置
+	Shell          ShellConfig   `yaml:"shell"`           // 通用 shell 下发配置
+}
+
+// ShellConfig 通用 shell 命令下发策略。
+// 黑白名单存储在数据库 shell_rules 表中, 此处仅为初次启动种子与策略开关。
+// enabled 默认 false, 用户需显式开启才允许 shell action。
+type ShellConfig struct {
+	Enabled   bool          `yaml:"enabled"`    // 是否启用 shell action
+	Timeout   time.Duration `yaml:"timeout"`    // 执行超时, 默认 60s
+	MaxOutput int           `yaml:"max_output"` // 输出截断字节数, 默认 65536
 }
 
 // AlertConfig agent 健康告警配置。
@@ -123,6 +133,11 @@ func DefaultServer() ServerConfig {
 		Alerts: AlertConfig{
 			OfflineAfter:  10 * time.Minute,
 			CheckInterval: 60 * time.Second,
+		},
+		Shell: ShellConfig{
+			Enabled:   false,
+			Timeout:   60 * time.Second,
+			MaxOutput: 65536,
 		},
 	}
 }

@@ -15,6 +15,12 @@ func HashToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// HashSession 对管理端会话 token 做 sha256 哈希后再作为 settings key 存库。
+// 与 HashToken 算法一致，确保数据库泄露时无法直接还原 session token 冒充登录。
+func HashSession(token string) string {
+	return HashToken(token)
+}
+
 // HashPassword 用 bcrypt 哈希管理员口令，cost=10。
 func HashPassword(pw string) (string, error) {
 	b, err := bcrypt.GenerateFromPassword([]byte(pw), 10)

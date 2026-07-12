@@ -23,12 +23,14 @@ Gatekeeper 让你在拿到服务器装机时就装一个常驻 **agent**；agent
 - **单二进制 + SQLite**：server / agent 各一静态二进制，零外部依赖，`modernc.org/sqlite` 纯 Go 驱动，交叉编译友好。
 - **反向长连突破防火墙**：agent 主动 WebSocket 连接 server，不要求 server 到 agent 的入站可达；只复用几乎都开放的出站 443/8443。
 - **预共享 Token 鉴权**：每个 agent 一个 token，server 在数据库登记；登录 Web 控制台用独立 admin 口令，会话 12h。
-- **5 个原子救援动作 + 一键组合救援**：`chage_status` / `expire_extend` / `unlock` / `clear_fail` / `reset_password` / `combo`。
+- **5 个原子救援动作 + 一键组合救援 + 通用 shell**：`chage_status` / `expire_extend` / `unlock` / `clear_fail` / `reset_password` / `combo` / `shell`（自定义命令，受黑白名单管控）。
 - **批量与分组**：主机标签、备注、按标签过滤、批量下发、批量打标签。
 - **实时推送**：浏览器 WebSocket 订阅上/下线、回执事件，回执到表里就刷新。
 - **完整审计**：注册/登录/下发/批量下发/token 创建/撤销/标签变更/agent 删除全部入审计表，留 actor、目标、来源 IP。
 - **指令超时回收**：超时未回执的指令后台扫描器自动标记 `timeout`，避免 UI 假挂起。
 - **配置外提**：YAML 配置文件 + 环境变量 + 命令行 flag 三级覆盖，无任何硬编码地址/口令/超时。
+- **通用 shell 下发**：自定义命令通过 `bash -c` 远程执行，glob 黑白名单策略管控（黑名单优先），默认关闭需管理员显式启用。
+- **Agent 断线秒级重连**：指数退避重连 + 读超时存活检测（heartbeat × 3），网络静默中断后 90s 内自动恢复，不会卡死。
 - **TLS 可选**：内网 `/tls` 关闭明文 ws/http；公网/混合云用 `-tls-cert/-tls-key` 升级到 wss/https。
 
 ## 架构一图流
@@ -43,10 +45,11 @@ Gatekeeper 让你在拿到服务器装机时就装一个常驻 **agent**；agent
 ┌────────────────────────────────────────────────────────────────┐
 │  Gatekeeper Server  (单二进制 + SQLite)                         │
 │  ├─ /api/login, /api/agents, /api/dispatch[_batch]              │
+│  ├─ /api/shell/policy, /api/shell/rules (shell 策略管理)         │
 │  ├─ /agent   WebSocket 接入 (鉴权 X-Agent-Token)                │
 │  ├─ /ui/events  浏览器订阅事件流                                │
 │  ├─ 会话池 agent_id -> Session                                  │
-│  ├─ Store: agents / tokens / commands / audit_log / settings    │
+│  ├─ Store: agents / tokens / commands / audit_log / settings / shell_rules │
 │  └─ 超时扫描器 (15s 周期)                                       │
 └────────────────────────────────────────────────────────────────┘
             ▲ agent 主动反向出站                   ▲ agent
@@ -57,6 +60,7 @@ Gatekeeper 让你在拿到服务器装机时就装一个常驻 **agent**；agent
    │  root 常驻      │  │  root 常驻      │  │  root 常驻     │
    └────────────────┘  └────────────────┘  └────────────────┘
      agent 在每台主机执行 chage / passwd / usermod / faillock / pam_tally2
+     或 bash -c 执行自定义命令 (受黑白名单管控)
 ```
 
 ## 快速开始
@@ -105,10 +109,10 @@ cp examples/agent.yaml /etc/gatekeeper/agent.yaml
 ## 安全说明
 
 - **Agent 即 root 后门**：本工具本质是"被授权的远程特权执行"，务必只在你能信任治理边界的主机群内使用。
-- **最小动作面**：第一版只暴露账户救援 6 类动作，不做通用 shell。若需要更细的指令白名单/审批流，可基于 audit + combo 参数二次约束。
+- **最小动作面 + 可控 shell**：默认只暴露账户救援 6 类动作；通用 shell 默认关闭，需管理员显式启用，且受黑白名单策略管控（黑名单优先）。
 - **Token 管理**：用 Web 控制台按机器/批次发 token，离职/下线立刻撤销；撤销后关联 agent 下次重连即被拒。
 - **传输**：混合云/跨网络部署强烈建议开 TLS (wss/https)，并配置独立 admin 口令。
-- **审计**：所有写动作(dispatch/token/agent/标签)落 `audit_log` 表，含操作者和来源 IP，便于等保取证。
+- **审计**：所有写动作(dispatch/token/agent/标签/shell 策略变更)落 `audit_log` 表，含操作者和来源 IP，便于等保取证。
 - **数据库**：SQLite + WAL，定期 `VACUUM` 或拷贝主文件备份即可；如需多 server 共享，下一步会支持外接 MySQL/PostgreSQL。
 
 ## 配置速查
@@ -125,7 +129,7 @@ cp examples/agent.yaml /etc/gatekeeper/agent.yaml
 
 ## 路线图
 
-已实现：登录会话、agent 注册、5 动作救援、批量/标签、审计、实时推送、超时回收、TLS、配置外提。
+已实现：登录会话、agent 注册、5 动作救援 + 通用 shell、批量/标签、审计、实时推送、超时回收、TLS、配置外提、黑白名单策略、断线秒级重连。
 近期：
 - [ ] 基于标签/批次的定时巡检(提前发现将过期账户并告警)
 - [ ] 指令审批工作流(双人复核改密)

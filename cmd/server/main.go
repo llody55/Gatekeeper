@@ -75,11 +75,11 @@ func main() {
 	// 处理 agent token
 	if cfg.Agent.BootstrapToken != "" {
 		_ = store.EnsureToken(cfg.Agent.BootstrapToken, "bootstrap", "")
-		log.Printf("[bootstrap] 已登记 agent token (来自配置): %s", cfg.Agent.BootstrapToken)
+		log.Printf("[bootstrap] 已登记 agent token (来自配置): %s...", server.TokenPrefix(cfg.Agent.BootstrapToken))
 	} else if n, _ := store.TokenCount(); n == 0 {
 		t := randomHex(10)
 		_ = store.EnsureToken(t, "auto-bootstrap", "")
-		store.Audit("system", "token_bootstrap", t, "auto generated on first run", "127.0.0.1")
+		store.Audit("system", "token_bootstrap", server.TokenPrefix(t), "auto generated on first run", "127.0.0.1")
 		log.Printf("[bootstrap] 首次启动无任何 agent token，已自动生成: %s", t)
 	}
 
@@ -89,8 +89,59 @@ func main() {
 	go alertChecker.Run(alertCh)
 
 	srv := server.New(store, cfg.TrustedProxies, cfg.Agent.BindBootstrapToken,
-		int(cfg.Defaults.HistoryRetention/(24*time.Hour)))
+		int(cfg.Defaults.HistoryRetention/(24*time.Hour)), cfg.UI.SessionTTL)
 	srv.SetAlerter(alertChecker)
+
+	// 初始化 shell 策略: 种子默认黑白名单 + 加载配置到内存
+	if err := store.SeedShellRules(); err != nil {
+		log.Printf("[shell] 种子默认规则失败: %v", err)
+	}
+	// 配置文件为首次启动提供初始值; 后续以 DB settings 为准(用户可通过 API 修改)
+	shellEnabled := cfg.Shell.Enabled
+	if v, _ := store.SettingGet("shell_enabled"); v != "" {
+		shellEnabled = v == "1"
+	} else {
+		shellStr := "0"
+		if shellEnabled {
+			shellStr = "1"
+		}
+		_ = store.SettingSet("shell_enabled", shellStr)
+	}
+	shellTimeout := cfg.Shell.Timeout
+	if shellTimeout <= 0 {
+		shellTimeout = 60 * time.Second
+	}
+	if v, _ := store.SettingGet("shell_timeout"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			shellTimeout = time.Duration(n) * time.Second
+		}
+	} else {
+		_ = store.SettingSet("shell_timeout", strconv.Itoa(int(shellTimeout/time.Second)))
+	}
+	shellMaxOutput := cfg.Shell.MaxOutput
+	if shellMaxOutput <= 0 {
+		shellMaxOutput = 65536
+	}
+	if v, _ := store.SettingGet("shell_max_output"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			shellMaxOutput = n
+		}
+	} else {
+		_ = store.SettingSet("shell_max_output", strconv.Itoa(shellMaxOutput))
+	}
+	// 匹配模式: legacy(默认) / permissive / strict_chars / strict_glob
+	shellMatchMode := "legacy"
+	if v, _ := store.SettingGet("shell_match_mode"); v != "" {
+		shellMatchMode = v
+	} else {
+		_ = store.SettingSet("shell_match_mode", shellMatchMode)
+	}
+	srv.SetShellConfig(shellEnabled, shellTimeout, shellMaxOutput, shellMatchMode)
+	if shellEnabled {
+		log.Printf("[shell] 通用 shell 下发已启用: timeout=%s max_output=%d match_mode=%s", shellTimeout, shellMaxOutput, shellMatchMode)
+	} else {
+		log.Printf("[shell] 通用 shell 下发未启用 (配置 shell.enabled=false)")
+	}
 	if len(cfg.TrustedProxies) == 0 {
 		log.Printf("[security] 未配置 trusted_proxies, 将忽略所有 X-Forwarded-For, 使用直连 IP 做登录限速(公网部署推荐)")
 	} else {

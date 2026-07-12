@@ -91,6 +91,16 @@ CREATE TABLE IF NOT EXISTS users (
   created_at    INTEGER NOT NULL,
   disabled      INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS shell_rules (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  type          TEXT NOT NULL,           -- 'whitelist' 或 'blacklist'
+  pattern       TEXT NOT NULL,           -- glob 匹配模式, * 匹配任意字符
+  note          TEXT,                    -- 可选说明
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shell_rules_type ON shell_rules(type, enabled);
 `)
 	if err != nil {
 		return err
@@ -123,7 +133,7 @@ func (s *Store) EnsureToken(rawToken, note, boundAgentID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := HashToken(rawToken)
-	prefix := tokenPrefix(rawToken)
+	prefix := TokenPrefix(rawToken)
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO tokens(token, token_prefix, note, created_at, bound_agent_id) VALUES(?,?,?,?,?)`,
 		h, prefix, note, time.Now().Unix(), boundAgentID)
 	return err
@@ -286,8 +296,8 @@ func (s *Store) ValidToken(rawToken string) (bool, error) {
 // TokenHashForAgent 返回与该原始 token 对应的哈希，用于 agents 表 token 字段去标识存储。
 func (s *Store) TokenHashForAgent(rawToken string) string { return HashToken(rawToken) }
 
-// tokenPrefix 取原始 token 前 8 位作为 UI 识别用。
-func tokenPrefix(raw string) string {
+// TokenPrefix 取原始 token 前 8 位作为 UI 识别用, 不暴露完整 token。
+func TokenPrefix(raw string) string {
 	if len(raw) <= 8 {
 		return raw
 	}
@@ -641,8 +651,8 @@ func (s *Store) HostnameOf(agentID string) string {
 	return h.String
 }
 
-// ListCmdsPaged 分页返回指令列表与总数。page 从 1 起。
-func (s *Store) ListCmdsPaged(page, pageSize int, agentID string) ([]CmdRow, int, error) {
+// ListCmdsPaged 分页返回指令列表与总数。page 从 1 起。actionFilter 为空表示不限。
+func (s *Store) ListCmdsPaged(page, pageSize int, agentID, actionFilter string) ([]CmdRow, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -659,6 +669,14 @@ func (s *Store) ListCmdsPaged(page, pageSize int, agentID string) ([]CmdRow, int
 	if agentID != "" {
 		where = " WHERE agent_id = ?"
 		args = append(args, agentID)
+	}
+	if actionFilter != "" {
+		if where == "" {
+			where = " WHERE action = ?"
+		} else {
+			where += " AND action = ?"
+		}
+		args = append(args, actionFilter)
 	}
 	var total int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM commands"+where, args...).Scan(&total); err != nil {
@@ -840,6 +858,28 @@ func (s *Store) SettingSet(k, v string) error {
 		ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at`,
 		k, v, time.Now().Unix())
 	return err
+}
+
+// DeleteSessionsByActor 清除指定用户的所有活跃会话。
+// 用于改密/禁用/删除用户时即时吊销既有 session, 防止被禁用户继续操作。
+func (s *Store) DeleteSessionsByActor(actor string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT k FROM settings WHERE k LIKE 'session:%' AND v LIKE ?`, actor+"|%")
+	if err != nil {
+		return
+	}
+	var keys []string
+	for rows.Next() {
+		var k string
+		if rows.Scan(&k) == nil {
+			keys = append(keys, k)
+		}
+	}
+	rows.Close()
+	for _, k := range keys {
+		_, _ = s.db.Exec(`DELETE FROM settings WHERE k=?`, k)
+	}
 }
 
 // ---- 用户与 RBAC ----
@@ -1037,3 +1077,182 @@ type AuditRow struct {
 
 // keep fmt import (used indirectly through tests / future)
 var _ = fmt.Sprintf
+
+// ---- Shell 规则管理 ----
+
+// ShellRule 描述一条 shell 黑/白名单规则。
+type ShellRule struct {
+	ID        int64     `json:"id"`
+	Type      string    `json:"type"`    // whitelist / blacklist
+	Pattern   string    `json:"pattern"` // glob 匹配模式
+	Note      string    `json:"note"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ListShellRules 返回指定类型的规则列表; enabledOnly=true 时只返回启用的规则。
+func (s *Store) ListShellRules(ruleType string, enabledOnly bool) ([]ShellRule, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := `SELECT id, type, pattern, COALESCE(note,''), enabled, created_at, updated_at FROM shell_rules`
+	args := []interface{}{}
+	if ruleType != "" {
+		q += ` WHERE type=?`
+		args = append(args, ruleType)
+	}
+	if enabledOnly {
+		if len(args) > 0 {
+			q += ` AND enabled=1`
+		} else {
+			q += ` WHERE enabled=1`
+		}
+	}
+	q += ` ORDER BY type, id`
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ShellRule
+	for rows.Next() {
+		var r ShellRule
+		var enabled, created, updated int64
+		if err := rows.Scan(&r.ID, &r.Type, &r.Pattern, &r.Note, &enabled, &created, &updated); err != nil {
+			return nil, err
+		}
+		r.Enabled = enabled == 1
+		r.CreatedAt = time.Unix(created, 0)
+		r.UpdatedAt = time.Unix(updated, 0)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// AddShellRule 新增一条规则。type 必须为 whitelist 或 blacklist。
+func (s *Store) AddShellRule(ruleType, pattern, note string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	res, err := s.db.Exec(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+		ruleType, pattern, note, 1, now, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// UpdateShellRule 更新一条规则的 pattern/note/enabled。
+func (s *Store) UpdateShellRule(id int64, pattern, note string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := 0
+	if enabled {
+		e = 1
+	}
+	_, err := s.db.Exec(`UPDATE shell_rules SET pattern=?, note=?, enabled=?, updated_at=? WHERE id=?`,
+		pattern, note, e, time.Now().Unix(), id)
+	return err
+}
+
+// DeleteShellRule 硬删除一条规则。
+func (s *Store) DeleteShellRule(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM shell_rules WHERE id=?`, id)
+	return err
+}
+
+// CountShellRules 返回 shell_rules 表总行数, 用于判断是否需要种子默认数据。
+func (s *Store) CountShellRules() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM shell_rules`).Scan(&n)
+	return n, err
+}
+
+// SeedShellRules 在 shell_rules 表为空时插入默认黑白名单。
+func (s *Store) SeedShellRules() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM shell_rules`).Scan(&n); err != nil {
+		return fmt.Errorf("seed: count shell_rules: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	// 默认白名单: 常用安全只读/运维命令
+	whitelist := []struct{ pattern, note string }{
+		{"systemctl status *", "查看服务状态"},
+		{"systemctl restart *", "重启服务"},
+		{"systemctl start *", "启动服务"},
+		{"systemctl stop *", "停止服务"},
+		{"journalctl *", "查看日志"},
+		{"df *", "查看磁盘"},
+		{"free *", "查看内存"},
+		{"ps *", "查看进程"},
+		{"netstat *", "查看网络连接"},
+		{"ss *", "查看 socket"},
+		{"tail *", "查看日志尾部"},
+		{"head *", "查看文件头部"},
+		{"cat /etc/*", "查看配置文件"},
+		{"ls *", "列出目录"},
+		{"ping *", "网络连通性测试"},
+		{"uptime", "系统负载"},
+		{"uname *", "系统信息"},
+		{"hostname", "主机名"},
+		{"ip *", "网络接口信息"},
+		{"dmesg *", "内核日志"},
+		{"who", "登录用户"},
+		{"w", "登录用户详情"},
+		{"date", "系统时间"},
+	}
+	// 默认黑名单: 危险操作
+	blacklist := []struct{ pattern, note string }{
+		{"rm -rf /*", "递归删除根目录"},
+		{"rm -rf /", "递归删除根目录"},
+		{"rm -rf *", "递归删除当前目录所有文件"},
+		{"shutdown*", "关机"},
+		{"reboot*", "重启"},
+		{"halt*", "停机"},
+		{"init *", "切换运行级别"},
+		{"mkfs*", "格式化文件系统"},
+		{"dd *of=/dev/*", "写入块设备"},
+		{"chmod -R * / *", "递归修改根目录权限"},
+		{"chown -R * / *", "递归修改根目录属主"},
+		{" :* ", "fork bomb"},
+		{"> /dev/sda*", "写入块设备"},
+		{"mv /* /dev/null", "将根目录移入黑洞"},
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("seed: begin tx: %w", err)
+	}
+	for _, r := range whitelist {
+		if _, err := tx.Exec(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+			"whitelist", r.pattern, r.note, 1, now, now); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("seed: insert whitelist %q: %w", r.pattern, err)
+		}
+	}
+	for _, r := range blacklist {
+		if _, err := tx.Exec(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+			"blacklist", r.pattern, r.note, 1, now, now); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("seed: insert blacklist %q: %w", r.pattern, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// ShellSettingGet 读取 shell 策略设置 (enabled/timeout/max_output), 缺省回退到传入默认值。
+func (s *Store) ShellSettingGet(key string, defVal string) string {
+	v, err := s.SettingGet("shell_" + key)
+	if err != nil || v == "" {
+		return defVal
+	}
+	return v
+}

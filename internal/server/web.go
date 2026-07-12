@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -95,12 +96,40 @@ func loginFail(ip string) int {
 	return maxCool
 }
 
-// loginOK 清空失败计数。
+// loginOK 清空当前 IP 的失败计数。
+// 不重置全局计数器: 防止攻击者用自己账号正常登录来重置全局限速,
+// 然后利用重置窗口对 admin 账号发起暴力破解。
 func loginOK(ip string) {
 	loginMu.Lock()
 	delete(loginStats, ip)
-	loginGlobal = loginState{}
 	loginMu.Unlock()
+}
+
+// loginSweep 清理 loginStats 中已过期且不在冷却期的条目, 防止 map 无限增长。
+// 应由定时器周期调用。
+func loginSweep() {
+	loginMu.Lock()
+	defer loginMu.Unlock()
+	now := time.Now()
+	for ip, st := range loginStats {
+		// 窗口已过 且 不在冷却期(或冷却已到期) -> 清除
+		if now.Sub(st.windowStart) > loginWindow {
+			if st.cooldownEnd.IsZero() || now.After(st.cooldownEnd) {
+				delete(loginStats, ip)
+			}
+		}
+	}
+}
+
+// initLoginSweeper 启动后台 goroutine 周期清理 loginStats 过期条目。
+func initLoginSweeper() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			loginSweep()
+		}
+	}()
 }
 
 // AuthCtx 保存已通过鉴权的管理上下文。
@@ -120,8 +149,11 @@ func (ac AuthCtx) HasRole(roles ...string) bool {
 	return false
 }
 
+var loginSweeperOnce sync.Once
+
 // Mux 返回带 API + Web UI 的 mux。允许 query token 访问受 ui.AllowQueryToken 控制。
 func (s *Server) Mux(cfg config.ServerConfig) http.Handler {
+	loginSweeperOnce.Do(initLoginSweeper)
 	m := http.NewServeMux()
 	m.HandleFunc("/agent", s.AgentWS)
 	m.HandleFunc("/ui/events", s.UIEventsGuard(cfg))
@@ -163,6 +195,8 @@ func (s *Server) UIEventsGuard(cfg config.ServerConfig) http.HandlerFunc {
 }
 
 // authCheck 校验会话 token，返回 actor 信息。兼容旧 query token。
+// query ?t=<token> 仅对 /ui/events (WebSocket 端点) 开放, 因为浏览器 WebSocket API 无法设置 Authorization 头。
+// 对 /api/* REST 端点只接受 Authorization 头, 避免 token 出现在 URL/日志/Referer 中泄露。
 func (s *Server) authCheck(w http.ResponseWriter, r *http.Request, cfg config.ServerConfig) (AuthCtx, bool) {
 	get := func(name string) string { return r.Header.Get(name) }
 	// 1) Authorization: Bearer <session>
@@ -172,13 +206,15 @@ func (s *Server) authCheck(w http.ResponseWriter, r *http.Request, cfg config.Se
 			return AuthCtx{Actor: actor, Role: role, IP: s.clientIP(r)}, true
 		}
 	}
-	// 2) query ?t=<token>  (AllowQueryToken)
-	if q := r.URL.Query().Get("t"); q != "" {
-		if actor, role, ok := s.checkSession(q); ok {
-			return AuthCtx{Actor: actor, Role: role, IP: s.clientIP(r)}, true
-		}
-		if cfg.UI.AllowQueryToken && q == cfg.UI.AdminPassword {
-			return AuthCtx{Actor: "admin", Role: "admin", IP: s.clientIP(r)}, true
+	// 2) query ?t=<token> 仅限 WebSocket 端点 /ui/events
+	if r.URL.Path == "/ui/events" {
+		if q := r.URL.Query().Get("t"); q != "" {
+			if actor, role, ok := s.checkSession(q); ok {
+				return AuthCtx{Actor: actor, Role: role, IP: s.clientIP(r)}, true
+			}
+			if cfg.UI.AllowQueryToken && q == cfg.UI.AdminPassword {
+				return AuthCtx{Actor: "admin", Role: "admin", IP: s.clientIP(r)}, true
+			}
 		}
 	}
 	// 3) 特例：登录接口必须放行
@@ -192,8 +228,11 @@ func (s *Server) authCheck(w http.ResponseWriter, r *http.Request, cfg config.Se
 
 // checkSession 校验会话 token 是否有效, 返回 (username, role, ok)。
 // session 值格式: username|role|expiresUnix
+// token 在入库前已做 sha256 哈希, 此处用哈希值查库, 数据库中不留 token 原文。
+// 校验通过后额外检查用户当前状态: 若用户已被禁用或删除, 会话立即失效。
 func (s *Server) checkSession(tok string) (string, string, bool) {
-	v, err := s.Store.SettingGet("session:" + tok)
+	h := HashSession(tok)
+	v, err := s.Store.SettingGet("session:" + h)
 	if err != nil || v == "" {
 		return "", "", false
 	}
@@ -210,7 +249,12 @@ func (s *Server) checkSession(tok string) (string, string, bool) {
 		return "", "", false
 	}
 	if time.Now().Unix() > ts {
-		_ = s.Store.SettingSet("session:"+tok, "")
+		_ = s.Store.SettingSet("session:"+h, "")
+		return "", "", false
+	}
+	// 检查用户当前状态: 被禁用或已删除则会话失效
+	if u, _, _ := s.Store.GetUser(parts[0]); u == nil || u.Disabled {
+		_ = s.Store.SettingSet("session:"+h, "")
 		return "", "", false
 	}
 	return parts[0], role, true
@@ -288,9 +332,10 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 		s.handleAgentUpdateID(w, r)
 	case path == "/api/commands" && r.Method == http.MethodGet:
 		agentID := r.URL.Query().Get("agent_id")
+		actionFilter := r.URL.Query().Get("action")
 		page := atoiDefault(r.URL.Query().Get("page"), 1)
 		pageSize := atoiDefault(r.URL.Query().Get("page_size"), 10)
-		cmds, total, err := s.Store.ListCmdsPaged(page, pageSize, agentID)
+		cmds, total, err := s.Store.ListCmdsPaged(page, pageSize, agentID, actionFilter)
 		respond(w, pagedResult(cmds, total, page, pageSize), err)
 	case path == "/api/tokens" && r.Method == http.MethodGet:
 		page := atoiDefault(r.URL.Query().Get("page"), 1)
@@ -402,6 +447,34 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 		s.handleUserDelete(w, r)
 	case path == "/api/alerts/test" && r.Method == http.MethodPost:
 		s.handleAlertTest(w, r)
+	case path == "/api/shell/policy" && r.Method == http.MethodGet:
+		s.handleShellPolicyGet(w, r)
+	case path == "/api/shell/policy" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
+		s.handleShellPolicySet(w, r)
+	case path == "/api/shell/rules" && r.Method == http.MethodGet:
+		s.handleShellRulesList(w, r)
+	case path == "/api/shell/rules" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
+		s.handleShellRuleAdd(w, r)
+	case path == "/api/shell/rules/update" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
+		s.handleShellRuleUpdate(w, r)
+	case path == "/api/shell/rules/delete" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
+		s.handleShellRuleDelete(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -458,6 +531,10 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "username and password required", http.StatusBadRequest)
 		return
 	}
+	if len(body.Password) < 8 {
+		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+		return
+	}
 	if body.Role == "" {
 		body.Role = "operator"
 	}
@@ -494,6 +571,10 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "username and password required", http.StatusBadRequest)
 		return
 	}
+	if len(body.Password) < 8 {
+		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+		return
+	}
 	h, err := HashPassword(body.Password)
 	if err != nil {
 		http.Error(w, "hash error", http.StatusInternalServerError)
@@ -503,6 +584,8 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	// 改密后吊销该用户所有既有会话, 强制重新登录
+	s.Store.DeleteSessionsByActor(body.Username)
 	s.Store.Audit(ac.Actor, "user_password_change", body.Username, "", ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
@@ -532,6 +615,10 @@ func (s *Server) handleUserDisable(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.SetUserDisabled(body.Username, body.Disabled); err != nil {
 		respond(w, nil, err)
 		return
+	}
+	// 禁用用户时即时吊销其所有会话; 启用时无需操作
+	if body.Disabled {
+		s.Store.DeleteSessionsByActor(body.Username)
 	}
 	s.Store.Audit(ac.Actor, "user_disable", body.Username, fmt.Sprintf("disabled=%v", body.Disabled), ac.IP)
 	respond(w, map[string]bool{"disabled": body.Disabled}, nil)
@@ -566,6 +653,8 @@ func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	// 删除用户后吊销其所有会话
+	s.Store.DeleteSessionsByActor(body.Username)
 	s.Store.Audit(ac.Actor, "user_delete", body.Username, "hard delete", ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
@@ -601,6 +690,161 @@ func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Store.Audit(ac.Actor, "alert_test", body.AgentID, "手动触发 webhook 测试", ac.IP)
 	respond(w, map[string]string{"status": "sent", "agent_id": body.AgentID}, nil)
+}
+
+// ---- Shell 策略与规则管理 handlers ----
+
+// handleShellPolicyGet 返回当前 shell 策略配置 (启用状态/超时/输出截断/匹配模式)。
+func (s *Server) handleShellPolicyGet(w http.ResponseWriter, r *http.Request) {
+	respond(w, map[string]any{
+		"enabled":    s.IsShellEnabled(),
+		"timeout":    int(s.ShellTimeout() / time.Second),
+		"max_output": s.ShellMaxOutput(),
+		"match_mode": s.ShellMatchModeStr(),
+	}, nil)
+}
+
+// handleShellPolicySet 更新 shell 策略配置, 同时持久化到 DB 并刷新内存。
+func (s *Server) handleShellPolicySet(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled   bool   `json:"enabled"`
+		Timeout   int    `json:"timeout"`
+		MaxOutput int    `json:"max_output"`
+		MatchMode string `json:"match_mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		badRequest(w, "请求体格式错误: "+err.Error())
+		return
+	}
+	if body.Timeout < 1 || body.Timeout > 600 {
+		badRequest(w, "超时必须在 1~600 秒之间")
+		return
+	}
+	if body.MaxOutput < 1024 || body.MaxOutput > 1048576 {
+		badRequest(w, "输出截断必须在 1024~1048576 字节之间")
+		return
+	}
+	matchMode := validShellMatchMode(body.MatchMode)
+	// 持久化到 DB settings (重启后仍生效)
+	enStr := "0"
+	if body.Enabled {
+		enStr = "1"
+	}
+	if err := s.Store.SettingSet("shell_enabled", enStr); err != nil {
+		respond(w, nil, fmt.Errorf("persist shell_enabled: %w", err))
+		return
+	}
+	if err := s.Store.SettingSet("shell_timeout", strconv.Itoa(body.Timeout)); err != nil {
+		respond(w, nil, fmt.Errorf("persist shell_timeout: %w", err))
+		return
+	}
+	if err := s.Store.SettingSet("shell_max_output", strconv.Itoa(body.MaxOutput)); err != nil {
+		respond(w, nil, fmt.Errorf("persist shell_max_output: %w", err))
+		return
+	}
+	if err := s.Store.SettingSet("shell_match_mode", matchMode); err != nil {
+		respond(w, nil, fmt.Errorf("persist shell_match_mode: %w", err))
+		return
+	}
+	// 刷新内存中的策略状态
+	s.SetShellConfig(body.Enabled, time.Duration(body.Timeout)*time.Second, body.MaxOutput, matchMode)
+	ac := actorOf(r)
+	s.Store.Audit(ac.Actor, "shell_policy_set", "", fmt.Sprintf("enabled=%v timeout=%ds max_output=%d match_mode=%s", body.Enabled, body.Timeout, body.MaxOutput, matchMode), ac.IP)
+	respond(w, map[string]string{"status": "ok"}, nil)
+}
+
+// handleShellRulesList 返回全部 shell 规则 (黑白名单), 供 UI 分组渲染。
+func (s *Server) handleShellRulesList(w http.ResponseWriter, r *http.Request) {
+	rules, err := s.Store.ListShellRules("", false)
+	respond(w, rules, err)
+}
+
+// handleShellRuleAdd 新增一条 shell 规则。
+func (s *Server) handleShellRuleAdd(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Type    string `json:"type"`
+		Pattern string `json:"pattern"`
+		Note    string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		badRequest(w, "请求体格式错误: "+err.Error())
+		return
+	}
+	if body.Type != "whitelist" && body.Type != "blacklist" {
+		badRequest(w, "类型必须为 whitelist 或 blacklist")
+		return
+	}
+	if strings.TrimSpace(body.Pattern) == "" {
+		badRequest(w, "模式不能为空")
+		return
+	}
+	id, err := s.Store.AddShellRule(body.Type, body.Pattern, body.Note)
+	if err != nil {
+		respond(w, nil, fmt.Errorf("add rule: %w", err))
+		return
+	}
+	ac := actorOf(r)
+	s.Store.Audit(ac.Actor, "shell_rule_add", strconv.FormatInt(id, 10), fmt.Sprintf("type=%s pattern=%s note=%s", body.Type, body.Pattern, body.Note), ac.IP)
+	respond(w, map[string]any{"id": id, "status": "ok"}, nil)
+}
+
+// handleShellRuleUpdate 更新 shell 规则; pattern 为空时保留原值 (支持仅切换 enabled)。
+func (s *Server) handleShellRuleUpdate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID      int64  `json:"id"`
+		Pattern string `json:"pattern"`
+		Note    string `json:"note"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		badRequest(w, "请求体格式错误: "+err.Error())
+		return
+	}
+	if body.ID <= 0 {
+		badRequest(w, "id 不能为空")
+		return
+	}
+	// 仅切换 enabled 时 (pattern 为空), 保留原 pattern/note
+	pattern, note := body.Pattern, body.Note
+	if strings.TrimSpace(pattern) == "" {
+		all, _ := s.Store.ListShellRules("", false)
+		for _, rr := range all {
+			if rr.ID == body.ID {
+				pattern = rr.Pattern
+				note = rr.Note
+				break
+			}
+		}
+	}
+	if err := s.Store.UpdateShellRule(body.ID, pattern, note, body.Enabled); err != nil {
+		respond(w, nil, fmt.Errorf("update rule: %w", err))
+		return
+	}
+	ac := actorOf(r)
+	s.Store.Audit(ac.Actor, "shell_rule_update", strconv.FormatInt(body.ID, 10), fmt.Sprintf("enabled=%v pattern=%s", body.Enabled, pattern), ac.IP)
+	respond(w, map[string]string{"status": "ok"}, nil)
+}
+
+// handleShellRuleDelete 硬删除一条 shell 规则。
+func (s *Server) handleShellRuleDelete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		badRequest(w, "请求体格式错误: "+err.Error())
+		return
+	}
+	if body.ID <= 0 {
+		badRequest(w, "id 不能为空")
+		return
+	}
+	if err := s.Store.DeleteShellRule(body.ID); err != nil {
+		respond(w, nil, fmt.Errorf("delete rule: %w", err))
+		return
+	}
+	ac := actorOf(r)
+	s.Store.Audit(ac.Actor, "shell_rule_delete", strconv.FormatInt(body.ID, 10), "", ac.IP)
+	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -648,16 +892,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	loginOK(ip)
 	tok := genSession()
-	expires := time.Now().Add(12 * time.Hour).Unix()
-	_ = s.Store.SettingSet("session:"+tok, body.Username+"|"+u.Role+"|"+intToStr(expires))
-	s.Store.Audit(body.Username, "login", "", "session="+tok, ip)
+	expires := time.Now().Add(s.sessionTTL).Unix()
+	_ = s.Store.SettingSet("session:"+HashSession(tok), body.Username+"|"+u.Role+"|"+intToStr(expires))
+	s.Store.Audit(body.Username, "login", "", "ip="+ip, ip)
 	respond(w, map[string]string{"token": tok, "actor": body.Username, "role": u.Role, "expires_at": intToStr(expires)}, nil)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	a := r.Header.Get("Authorization")
 	tok := strings.TrimPrefix(a, "Bearer ")
-	_ = s.Store.SettingSet("session:"+tok, "")
+	_ = s.Store.SettingSet("session:"+HashSession(tok), "")
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
@@ -746,7 +990,7 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ac := actorOf(r)
-	s.Store.Audit(ac.Actor, "token_create", tok, "note="+body.Note+" bind="+body.BindAgentID, ac.IP)
+	s.Store.Audit(ac.Actor, "token_create", TokenPrefix(tok), "note="+body.Note+" bind="+body.BindAgentID, ac.IP)
 	respond(w, map[string]string{"token": tok, "note": body.Note, "bound_agent_id": body.BindAgentID}, nil)
 }
 
@@ -766,7 +1010,7 @@ func (s *Server) handleTokenBind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ac := actorOf(r)
-	s.Store.Audit(ac.Actor, "token_bind", body.Token, "agent_id="+body.AgentID, ac.IP)
+	s.Store.Audit(ac.Actor, "token_bind", TokenPrefix(body.Token), "agent_id="+body.AgentID, ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
@@ -789,7 +1033,7 @@ func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 		s.KickSession(bound)
 	}
 	ac := actorOf(r)
-	s.Store.Audit(ac.Actor, "token_revoke", body.Token, "", ac.IP)
+	s.Store.Audit(ac.Actor, "token_revoke", TokenPrefix(body.Token), "", ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
@@ -809,7 +1053,7 @@ func (s *Server) handleTokenDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ac := actorOf(r)
-	s.Store.Audit(ac.Actor, "token_delete", body.Token, "hard delete", ac.IP)
+	s.Store.Audit(ac.Actor, "token_delete", TokenPrefix(body.Token), "hard delete", ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
@@ -843,6 +1087,31 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if !validAction(req.Action) {
 		http.Error(w, "unknown action", http.StatusBadRequest)
 		return
+	}
+	// shell action 需要额外校验: 是否启用 + 黑白名单策略
+	if req.Action == proto.ActionShell {
+		if !s.shellEnabled {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "shell action not enabled"})
+			return
+		}
+		command := req.Params["command"]
+		if command == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "command required for shell action"})
+			return
+		}
+		allowed, reason := s.ShellAllowed(command)
+		if !allowed {
+			ac := actorOf(r)
+			s.Store.Audit(ac.Actor, "shell_blocked", req.AgentID, "cmd="+command+" reason="+reason, ac.IP)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "command blocked: " + reason})
+			return
+		}
 	}
 	// 在线下发：agent 反连会话不存在直接拒绝，避免命令变成无人接收的死信
 	if !s.IsOnline(req.AgentID) {
@@ -886,6 +1155,31 @@ func (s *Server) handleDispatchBatch(w http.ResponseWriter, r *http.Request) {
 	if !validAction(req.Action) {
 		http.Error(w, "unknown action", http.StatusBadRequest)
 		return
+	}
+	// shell action 需要额外校验: 是否启用 + 黑白名单策略 (与单发保持一致)
+	if req.Action == proto.ActionShell {
+		if !s.shellEnabled {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "shell action not enabled"})
+			return
+		}
+		command := req.Params["command"]
+		if command == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "command required for shell action"})
+			return
+		}
+		allowed, reason := s.ShellAllowed(command)
+		if !allowed {
+			ac := actorOf(r)
+			s.Store.Audit(ac.Actor, "shell_blocked", strings.Join(req.AgentIDs, ","), "cmd="+command+" reason="+reason, ac.IP)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "command blocked: " + reason})
+			return
+		}
 	}
 	ac := actorOf(r)
 	type oneRes struct {
@@ -931,6 +1225,8 @@ func validAction(a string) bool {
 	case proto.ActionChageStatus, proto.ActionExpireExtend, proto.ActionUnlock,
 		proto.ActionClearFail, proto.ActionResetPassword, proto.ActionCombo:
 		return true
+	case proto.ActionShell:
+		return true // shell 是否放行由 ShellAllowed 进一步校验
 	}
 	return false
 }
@@ -938,11 +1234,19 @@ func validAction(a string) bool {
 func respond(w http.ResponseWriter, v any, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
+		log.Printf("[api] internal error: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "internal error"})
 		return
 	}
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// badRequest 返回 400 JSON 错误, 用于客户端输入校验失败。
+func badRequest(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 func genToken() string {

@@ -37,6 +37,9 @@ Gatekeeper 不在源码里硬编码任何地址、口令或超时。所有运行
 | `agent.write_timeout` | duration | `10s` | 写超时 |
 | `defaults.cmd_timeout` | duration | `60s` | 单条指令回执超时；扫描器据此标记 timeout |
 | `defaults.history_retention` | duration | `720h` | 指令历史保留（留空=永久，自动清理待落地） |
+| `shell.enabled` | bool | `false` | 是否启用通用 shell 下发；需显式开启 |
+| `shell.timeout` | duration | `60s` | shell 命令执行超时 |
+| `shell.max_output` | int | `65536` | shell 输出截断字节数 (1024~1048576) |
 
 ### 环境变量示例
 

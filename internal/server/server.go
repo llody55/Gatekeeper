@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -25,13 +26,207 @@ type Server struct {
 	trustedProxies     []*net.IPNet  // 解析后的可信代理 CIDR；为空表示不信任任何 XFF
 	bindBootstrapToken bool          // 是否把首次被注册的 bootstrap token 自动绑定到该 agent_id
 	retentionMinDays   int           // YAML 配置的留存下限天数, UI/DB 不得低于此值
+	sessionTTL         time.Duration // 管理端会话有效期; 默认 12h
+	shellEnabled       bool          // shell action 是否启用
+	shellTimeout       time.Duration // shell 执行超时
+	shellMaxOutput     int           // shell 输出截断字节数
+	shellMatchMode     string        // shell 命令匹配模式: legacy / permissive / strict_chars / strict_glob
 	alert              *AlertChecker // agent 健康告警检查器; 可能为 nil
 }
 
+// Shell 匹配模式常量。
+const (
+	ShellMatchLegacy      = "legacy"       // 当前模式: * 匹配任意字符(含元字符)
+	ShellMatchPermissive  = "permissive"   // 允许所有: 跳过黑白名单检查
+	ShellMatchStrictChars = "strict_chars" // 拒元字符: 命令含 ;|& 等直接拒绝
+	ShellMatchStrictGlob  = "strict_glob"  // 严格通配: * 不匹配元字符, 精确规则允许元字符
+)
+
+// SetShellConfig 注入 shell 策略配置。
+func (s *Server) SetShellConfig(enabled bool, timeout time.Duration, maxOutput int, matchMode string) {
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	if maxOutput <= 0 {
+		maxOutput = 65536
+	}
+	s.shellEnabled = enabled
+	s.shellTimeout = timeout
+	s.shellMaxOutput = maxOutput
+	s.shellMatchMode = validShellMatchMode(matchMode)
+}
+
+// IsShellEnabled 返回 shell action 是否已启用。
+func (s *Server) IsShellEnabled() bool { return s.shellEnabled }
+
+// ShellTimeout 返回 shell 执行超时时长。
+func (s *Server) ShellTimeout() time.Duration { return s.shellTimeout }
+
+// ShellMaxOutput 返回 shell 输出截断字节数。
+func (s *Server) ShellMaxOutput() int { return s.shellMaxOutput }
+
+// ShellMatchModeStr 返回当前匹配模式名称。
+func (s *Server) ShellMatchModeStr() string { return s.shellMatchMode }
+
+// validShellMatchMode 校验并归一化匹配模式值，无效则回落到 legacy。
+func validShellMatchMode(m string) string {
+	switch m {
+	case ShellMatchLegacy, ShellMatchPermissive, ShellMatchStrictChars, ShellMatchStrictGlob:
+		return m
+	default:
+		return ShellMatchLegacy
+	}
+}
+
+// containsShellMetachars 检测命令是否含 shell 元字符(;|&$\`等)。
+// 这些字符在 bash -c 下有命令分隔/替换语义，可被利用绕过白名单。
+// 空格不是元字符——它只是参数分隔符，不影响 bash 的命令解析边界。
+func containsShellMetachars(s string) bool {
+	return strings.ContainsAny(s, ";&|`$\n\r()<>") || strings.Contains(s, "\\")
+}
+
+// ShellAllowed 判断命令是否被策略允许执行。
+// 返回 (allowed, reason)。
+// 判定优先级: 黑名单 > 白名单 > 放行。
+// 匹配模式影响过滤行为:
+//   - legacy:        * 匹配任意字符(含元字符)，当前行为
+//   - permissive:    跳过黑白名单，直接放行
+//   - strict_chars:  命令含元字符直接拒，否则走正常黑白名单
+//   - strict_glob:   * 不匹配元字符，精确规则(无*)允许元字符
+func (s *Server) ShellAllowed(command string) (bool, string) {
+	// permissive 模式: 跳过所有检查
+	if s.shellMatchMode == ShellMatchPermissive {
+		return true, ""
+	}
+
+	// strict_chars 模式: 先拒元字符，再走正常匹配
+	if s.shellMatchMode == ShellMatchStrictChars {
+		if containsShellMetachars(command) {
+			return false, "command contains shell metacharacters (;|& etc), blocked by strict_chars mode"
+		}
+	}
+
+	// 选择匹配函数
+	matchFn := globMatch
+	if s.shellMatchMode == ShellMatchStrictGlob {
+		matchFn = globMatchStrict
+	}
+
+	// 1. 黑名单优先
+	blackRules, _ := s.Store.ListShellRules("blacklist", true)
+	for _, r := range blackRules {
+		if matchFn(r.Pattern, command) {
+			return false, "blocked by blacklist: " + r.Pattern
+		}
+	}
+	// 2. 白名单非空则命令必须命中至少一条
+	whiteRules, _ := s.Store.ListShellRules("whitelist", true)
+	if len(whiteRules) == 0 {
+		return true, ""
+	}
+	for _, r := range whiteRules {
+		if matchFn(r.Pattern, command) {
+			return true, ""
+		}
+	}
+	return false, "not in whitelist"
+}
+
+// globMatch 简单 glob 匹配: * 匹配任意字符(含空格/斜杠), 其余字符精确匹配。
+// 例如 "systemctl *" 匹配 "systemctl restart nginx"
+//
+//	"cat /etc/*"   匹配 "cat /etc/nginx/nginx.conf"
+func globMatch(pattern, s string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == s
+	}
+	// 检查前缀
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	s = s[len(parts[0]):]
+	// 检查中间各段
+	for i := 1; i < len(parts)-1; i++ {
+		if parts[i] == "" {
+			continue // ** 等价于 *
+		}
+		idx := strings.Index(s, parts[i])
+		if idx < 0 {
+			return false
+		}
+		s = s[idx+len(parts[i]):]
+	}
+	// 检查后缀
+	return strings.HasSuffix(s, parts[len(parts)-1])
+}
+
+// globMatchStrict 与 globMatch 类似，但 * 不匹配 shell 元字符。
+// 精确规则（不含 *）允许元字符（如 "ps aux | grep nginx" 作为完整白名单）。
+// 含 * 的规则中，* 只匹配不含元字符的字符序列，防止 "systemctl restart *"
+// 被 "systemctl restart x; rm -rf /" 绕过。
+func globMatchStrict(pattern, s string) bool {
+	// 精确匹配(无 *)：允许元字符，用于白名单写死完整管道命令
+	if !strings.Contains(pattern, "*") {
+		return pattern == s
+	}
+
+	parts := strings.Split(pattern, "*")
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	rest := s[len(parts[0]):]
+
+	if len(parts) == 2 {
+		// 单 * 模式 (最常见): "prefix*" → rest 是 * 匹配的部分
+		return !containsShellMetachars(rest)
+	}
+
+	// 多 * 模式: 逐段匹配，每段 * 匹配部分不得含元字符
+	// 先用普通 globMatch 检查能否匹配
+	if !globMatch(pattern, s) {
+		return false
+	}
+	// 能匹配 → 追踪各 * 段并校验元字符
+	s2 := s[len(parts[0]):] // 重新从头开始追踪
+	for i := 1; i < len(parts)-1; i++ {
+		if parts[i] == "" {
+			continue
+		}
+		idx := strings.Index(s2, parts[i])
+		if idx < 0 {
+			return false
+		}
+		// s2[:idx] 是当前 * 匹配的段
+		if containsShellMetachars(s2[:idx]) {
+			return false
+		}
+		s2 = s2[idx+len(parts[i]):]
+	}
+	// 尾部 * 匹配的段
+	suffix := parts[len(parts)-1]
+	if suffix != "" {
+		if !strings.HasSuffix(s2, suffix) {
+			return false
+		}
+		if containsShellMetachars(s2[:len(s2)-len(suffix)]) {
+			return false
+		}
+	} else {
+		if containsShellMetachars(s2) {
+			return false
+		}
+	}
+	return true
+}
+
 // New 构造 Server；trustedProxies 为 CIDR 字符串列表，"any" 表示信任所有。
-func New(s *Store, trustedProxies []string, bindBootstrapToken bool, retentionMinDays int) *Server {
+func New(s *Store, trustedProxies []string, bindBootstrapToken bool, retentionMinDays int, sessionTTL time.Duration) *Server {
+	if sessionTTL <= 0 {
+		sessionTTL = 12 * time.Hour
+	}
 	srv := &Server{Store: s, sessions: map[string]*Session{}, uiHub: newUIHub(),
-		bindBootstrapToken: bindBootstrapToken, retentionMinDays: retentionMinDays}
+		bindBootstrapToken: bindBootstrapToken, retentionMinDays: retentionMinDays, sessionTTL: sessionTTL}
 	for _, c := range trustedProxies {
 		c = strings.TrimSpace(c)
 		if c == "" {
@@ -67,7 +262,43 @@ type Session struct {
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     checkOrigin,
+}
+
+// checkOrigin 校验 WebSocket 请求来源: 允许同源浏览器请求和非浏览器客户端(无 Origin 头)。
+// 阻止跨站 WebSocket 劫持(CSWSH): 恶意网页无法从不同 origin 连接 /ui/events 窃取事件流。
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	// 非浏览器客户端(如 agent 的 Go websocket dialer)不发送 Origin 头, 允许通过。
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	originHost := u.Hostname()
+	originPort := u.Port()
+	if originPort == "" {
+		// 浏览器对默认端口省略端口号
+		if u.Scheme == "https" || u.Scheme == "wss" {
+			originPort = "443"
+		} else {
+			originPort = "80"
+		}
+	}
+	reqHost := r.Host
+	if h, p, err := net.SplitHostPort(reqHost); err == nil {
+		reqHost = h + ":" + p
+	} else {
+		// 请求 Host 无端口, 补默认端口用于比较
+		if strings.HasPrefix(r.URL.Scheme, "https") || r.TLS != nil {
+			reqHost = reqHost + ":443"
+		} else {
+			reqHost = reqHost + ":80"
+		}
+	}
+	return originHost+":"+originPort == reqHost
 }
 
 // AgentWS 处理 agent 的 WebSocket 反向连接。
@@ -110,7 +341,7 @@ func (s *Server) AgentWS(w http.ResponseWriter, r *http.Request) {
 	if unbound && s.bindBootstrapToken {
 		// bootstrap token 首次被该 agent 使用: 自动绑定, 后续他人即便拿到此 token 也无法冒名。
 		_ = s.Store.BindToken(token, agentID)
-		s.Store.Audit("agent", "token_first_bind", token, "agent_id="+agentID, ip)
+		s.Store.Audit("agent", "token_first_bind", TokenPrefix(token), "agent_id="+agentID, ip)
 	}
 	if first, err := s.Store.TouchAgent(agentID, token, reg.Hostname, reg.OS, ip); err != nil {
 		log.Printf("[server] TouchAgent err: %v", err)

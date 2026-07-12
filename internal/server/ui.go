@@ -26,6 +26,7 @@ func uiHTML() string {
 		"    <button data-tab=\"audit\">审计日志</button>\n" +
 		"    <button data-tab=\"tokens\">Token</button>\n" +
 		"    <button data-tab=\"users\" class=\"admin-only\">用&shy;户</button>\n" +
+		"    <button data-tab=\"shell\" class=\"admin-only\">Shell</button>\n" +
 		"  </nav>\n" +
 		"  <div class=\"uinfo\" id=\"uinfo\"></div>\n" +
 		"</header>\n" +
@@ -62,12 +63,18 @@ func uiHTML() string {
 		"        <div class=\"field\"><label>账户</label><input id=\"userIn\" value=\"root\" style=\"width:120px\"></div>\n" +
 		"        <div class=\"field\"><label>动作</label><select id=\"actSel\" onchange=\"onActChange()\">\n" +
 		"          <option value=\"combo\">组合救援 (推荐)</option>" +
+		"          <option value=\"shell\">自定义命令</option>" +
 		"          <option value=\"chage_status\">查看过期状态</option>" +
 		"          <option value=\"expire_extend\">关闭密码过期</option>" +
 		"          <option value=\"unlock\">解锁账户</option>" +
 		"          <option value=\"clear_fail\">清除失败计数</option>" +
 		"          <option value=\"reset_password\">重置密码</option>" +
 		"        </select></div>\n" +
+		"      </div>\n" +
+		"      <div class=\"field\" id=\"shellOpts\" style=\"display:none\">\n" +
+		"        <label>命令</label>\n" +
+		"        <textarea id=\"shellCmd\" rows=\"2\" placeholder=\"systemctl restart nginx\" style=\"width:100%%;font-family:monospace\"></textarea>\n" +
+		"        <small style=\"color:#888\">命令通过 bash -c 执行, 受黑白名单策略限制</small>\n" +
 		"      </div>\n" +
 		"      <div class=\"chk-row\" id=\"comboOpts\">\n" +
 		"        <label class=\"chk\"><input type=\"checkbox\" id=\"cb_fail\" checked>清失败计数</label>\n" +
@@ -85,7 +92,7 @@ func uiHTML() string {
 		"    </div>\n" +
 		"  </section>\n" +
 		"  <section id=\"tab-cmd\" class=\"tab-content hidden\">\n" +
-		"    <div class=\"card\"><div class=\"card-h\"><h3>指令历史</h3><div class=\"r\"><select id=\"cmdAgentFilter\" onchange=\"cmdPage=1;loadCmds()\" style=\"min-width:220px\"></select><button class=\"ghost\" onclick=\"cmdPage=1;loadCmds()\">刷新</button></div></div></div>\n" +
+		"    <div class=\"card\"><div class=\"card-h\"><h3>指令历史</h3><div class=\"r\"><select id=\"cmdAgentFilter\" onchange=\"cmdPage=1;loadCmds()\" style=\"min-width:180px\"></select><select id=\"cmdActionFilter\" onchange=\"cmdPage=1;loadCmds()\"><option value=\"\">全部类型</option><option value=\"shell\">自定义命令</option><option value=\"combo\">组合救援</option><option value=\"chage_status\">查看过期</option><option value=\"expire_extend\">关闭过期</option><option value=\"unlock\">解锁账户</option><option value=\"clear_fail\">清除失败</option><option value=\"reset_password\">重置密码</option></select><button class=\"ghost\" onclick=\"cmdPage=1;loadCmds()\">刷新</button></div></div></div>\n" +
 		"    <div class=\"card\"><table class=\"tbl\"><thead><tr><th>时间</th><th>主机</th><th>动作</th><th>账户</th><th>创建者</th><th>状态</th><th>输出</th></tr></thead><tbody id=\"cmdBody\"></tbody></table>\n" +
 		"      <div class=\"pager\" id=\"cmdPager\"></div>\n" +
 		"    </div>\n" +
@@ -130,6 +137,34 @@ func uiHTML() string {
 		"    </div>\n" +
 		"    <div class=\"card\"><table class=\"tbl\"><thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody id=\"uBody\"></tbody></table></div>\n" +
 		"  </section>\n" +
+		"    <div class=\"tab-content hidden\" id=\"tab-shell\">\n" +
+		"      <h2>Shell 策略管理</h2>\n" +
+		"      <div style=\"margin-bottom:16px;padding:12px;background:#8aa0bd;border-radius:6px\">\n" +
+		"        <label><input type=\"checkbox\" id=\"shellEnabled\"> 启用 shell 下发</label>\n" +
+		"        <label style=\"margin-left:16px\">超时(秒): <input type=\"number\" id=\"shellTimeout\" value=\"60\" min=\"1\" max=\"600\" style=\"width:80px\"></label>\n" +
+		"        <label style=\"margin-left:16px\">输出截断(字节): <input type=\"number\" id=\"shellMaxOutput\" value=\"65536\" min=\"1024\" max=\"1048576\" style=\"width:100px\"></label>\n" +
+		"        <label style=\"margin-left:16px\">匹配模式: <select id=\"shellMatchMode\" style=\"width:180px\">\n" +
+		"          <option value=\"legacy\">legacy - 当前(*匹配任意)</option>\n" +
+		"          <option value=\"permissive\">permissive - 允许所有</option>\n" +
+		"          <option value=\"strict_chars\">strict_chars - 拒元字符</option>\n" +
+		"          <option value=\"strict_glob\">strict_glob - 严格通配</option>\n" +
+		"        </select></label>\n" +
+		"        <button onclick=\"saveShellPolicy()\" style=\"margin-left:12px\">保存策略</button>\n" +
+		"        <div style=\"margin-top:8px;font-size:11px;color:#cfe2ff\"><b>legacy</b>: *匹配任意字符(含;|&等)；<b>permissive</b>: 跳过黑白名单；<b>strict_chars</b>: 命令含元字符即拒；<b>strict_glob</b>: *不匹配元字符，精确规则允许管道</div>\n" +
+		"      </div>\n" +
+		"      <div style=\"display:flex;gap:16px\">\n" +
+		"        <div style=\"flex:1\">\n" +
+		"          <h3>白名单</h3>\n" +
+		"          <div style=\"margin-bottom:8px\"><input id=\"wlPattern\" placeholder=\"systemctl *\" style=\"width:200px\"><input id=\"wlNote\" placeholder=\"说明\" style=\"width:100px;margin-left:4px\"><button onclick=\"addShellRule('whitelist')\" style=\"margin-left:4px\">+</button></div>\n" +
+		"          <table id=\"wlTable\" class=\"tbl\"><thead><tr><th>模式</th><th>说明</th><th>启用</th><th>操作</th></tr></thead><tbody></tbody></table>\n" +
+		"        </div>\n" +
+		"        <div style=\"flex:1\">\n" +
+		"          <h3>黑名单</h3>\n" +
+		"          <div style=\"margin-bottom:8px\"><input id=\"blPattern\" placeholder=\"rm -rf /*\" style=\"width:200px\"><input id=\"blNote\" placeholder=\"说明\" style=\"width:100px;margin-left:4px\"><button onclick=\"addShellRule('blacklist')\" style=\"margin-left:4px\">+</button></div>\n" +
+		"          <table id=\"blTable\" class=\"tbl\"><thead><tr><th>模式</th><th>说明</th><th>启用</th><th>操作</th></tr></thead><tbody></tbody></table>\n" +
+		"        </div>\n" +
+		"      </div>\n" +
+		"    </div>\n" +
 		"</main>\n" +
 		"<div class=\"toast\" id=\"toast\"></div>\n" +
 		"<script>\n" +
@@ -219,7 +254,9 @@ func uiJS() string {
 		"async function api(path, opts, body){\n" +
 		"  const r = await fetch('/api'+path, {headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'}, method:opts||'GET', body:body?JSON.stringify(body):undefined});\n" +
 		"  if(r.status===401 && path!=='/login' && path!=='/me'){ localStorage.removeItem('gk_tok'); TOK=''; showLogin(); throw new Error('auth'); }\n" +
-		"  return r.json();\n" +
+		"  const j = await r.json();\n" +
+		"  if(!r.ok){ const msg = (j&&j.error)||('HTTP '+r.status); throw new Error(msg); }\n" +
+		"  return j;\n" +
 		"}\n" +
 		"// 从分页响应 {items,total,page,page_size,pages} 中取 items; 兼容老数组形态\n" +
 		"function pageItems(j){ return Array.isArray(j)?j:(j&&j.items)||[]; }\n" +
@@ -240,7 +277,7 @@ func uiJS() string {
 		"  [10,20,50,100,200].forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n+'/页';if(n===size)o.selected=true;sz.appendChild(o);});\n" +
 		"  sz.style.width='auto'; el.appendChild(sz);\n" +
 		"}\n" +
-		"function esc(s){return (s==null?'':String(s)).replace(/[<>&\"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','\"':'&quot;'}[c]));}\n" +
+		"function esc(s){return (s==null?'':String(s)).replace(/[<>&\"']/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','\"':'&quot;',\"'\":'&#39;'}[c]));}\n" +
 		"function fmtTime(t){if(!t)return '—'; const d=new Date(typeof t==='string'&&t.includes('T')?t:t*1000); return isNaN(d.getTime())?String(t):d.toLocaleString();}\n" +
 		"function toast(m){const e=document.getElementById('toast');e.textContent=m;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2500);}\n" +
 		"function $(id){return document.getElementById(id);}\n" +
@@ -250,11 +287,13 @@ func uiJS() string {
 		"function showLogin(){ $('login').classList.remove('hidden'); $('app').classList.add('hidden'); $('uinfo').innerHTML=''; setTimeout(()=>$('lu').focus(),30); }\n" +
 		"async function doLogin(){\n" +
 		"  $('loginErr').textContent='';\n" +
-		"  const u=$('lu').value||'admin';\n" +
-		"  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:$('pw').value})});\n" +
-		"  const j=await r.json();\n" +
-		"  if(!r.ok){$('loginErr').textContent=j.error||'登录失败';return;}\n" +
-		"  TOK=j.token; ROLE=j.role||'admin'; localStorage.setItem('gk_tok',TOK); localStorage.setItem('gk_role',ROLE); enterApp();\n" +
+		"  const u=$('lu').value.trim()||'admin';\n" +
+		"  try{\n" +
+		"    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:$('pw').value})});\n" +
+		"    const j=await r.json();\n" +
+		"    if(!r.ok){$('loginErr').textContent=j.error||'登录失败';return;}\n" +
+		"    TOK=j.token; ROLE=j.role||'admin'; localStorage.setItem('gk_tok',TOK); localStorage.setItem('gk_role',ROLE); enterApp();\n" +
+		"  }catch(e){ $('loginErr').textContent='无法连接服务器: '+e.message; }\n" +
 		"}\n" +
 		"function logout(){ fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+TOK}}); localStorage.removeItem('gk_tok'); localStorage.removeItem('gk_role'); TOK=''; ROLE='admin'; showLogin(); }\n" +
 		"async function enterApp(){\n" +
@@ -328,13 +367,10 @@ func uiJS() string {
 		"  const a=agents.find(x=>x.agent_id===id)||{};\n" +
 		"  const t=prompt('标签（逗号分隔，覆盖写入）:', (a.tags||[]).join(','));\n" +
 		"  if(t===null)return;\n" +
-		"  await api('/agent/'+encodeURIComponent(id),'POST',{tags:t.split(',').map(x=>x.trim()).filter(Boolean)});\n" +
-		"  toast('已更新'); loadAgents();\n" +
+		"  try{ await api('/agent/'+encodeURIComponent(id),'POST',{tags:t.split(',').map(x=>x.trim()).filter(Boolean)}); toast('已更新'); loadAgents(); }catch(e){ toast(e.message||'更新失败'); }\n" +
 		"}\n" +
 		"async function clearFailHere(id){\n" +
-		"  const r=await api('/dispatch','POST',{agent_id:id,action:'clear_fail',user:'root'});\n" +
-		"  toast('已下发清失败计数: '+(r.id||''));\n" +
-		"  setTimeout(loadCmds,1200);\n" +
+		"  try{ const r=await api('/dispatch','POST',{agent_id:id,action:'clear_fail',user:'root'}); toast('已下发清失败计数: '+(r.id||'')); setTimeout(loadCmds,1200); }catch(e){ toast(e.message||'下发失败'); }\n" +
 		"}\n" +
 		"function goBatch(){\n" +
 		"  if(selectedAgents.size===0){toast('请先勾选主机');return;}\n" +
@@ -347,8 +383,7 @@ func uiJS() string {
 		"  const t=prompt('为 '+selectedAgents.size+' 台主机打标签（逗号分隔，覆盖写入）:','');\n" +
 		"  if(t===null)return;\n" +
 		"  const tags=t.split(',').map(x=>x.trim()).filter(Boolean);\n" +
-		"  for(const id of selectedAgents){ await api('/agent/'+encodeURIComponent(id),'POST',{tags}); }\n" +
-		"  toast('已批量打标签'); await loadAgents();\n" +
+		"  try{ for(const id of selectedAgents){ await api('/agent/'+encodeURIComponent(id),'POST',{tags}); } toast('已批量打标签'); await loadAgents(); }catch(e){ toast(e.message||'批量打标签失败'); await loadAgents(); }\n" +
 		"}\n" +
 		"function refreshRescueSelect(){\n" +
 		"  const sel=$('agentSel'); if(!sel)return;\n" +
@@ -357,7 +392,7 @@ func uiJS() string {
 		"  if(cur){ for(const o of sel.options){if(o.value===cur){sel.value=cur;break;} } }\n" +
 		"}\n" +
 		"function saveRescueTarget(){ const sel=$('agentSel'); if(!sel||!sel.options.length){return;} $('rescueTarget').textContent='目标: '+(sel.options[sel.selectedIndex]?sel.options[sel.selectedIndex].textContent:''); }\n" +
-		"function onActChange(){ const v=$('actSel').value; $('comboOpts').style.display=v==='combo'?'flex':'none'; $('pwIn').parentElement.style.display=(v==='reset_password'||v==='combo')?'flex':'none'; }\n" +
+		"function onActChange(){ const v=$('actSel').value; $('comboOpts').style.display=v==='combo'?'flex':'none'; $('pwIn').parentElement.style.display=(v==='reset_password'||v==='combo')?'flex':'none'; $('shellOpts').style.display=v==='shell'?'block':'none'; }\n" +
 		"function buildParams(){\n" +
 		"  const a=$('actSel').value; const p={};\n" +
 		"  if(a==='reset_password'){ p.password=$('pwIn').value; if(!p.password){alert('请填新密码');return null;} p.force_change='false'; }\n" +
@@ -371,21 +406,26 @@ func uiJS() string {
 		"  return p;\n" +
 		"}\n" +
 		"async function dispatch(){\n" +
-		"  const params=buildParams(); if(params===null)return;\n" +
-		"  if($('agentSel').disabled && selectedAgents.size>0){\n" +
-		"    const r=await api('/dispatch_batch','POST',{agent_ids:[...selectedAgents],action:$('actSel').value,user:$('userIn').value||'root',params});\n" +
-		"    $('lastOut').textContent='批量已下发 '+r.length+' 条:\\n'+JSON.stringify(r,null,2);\n" +
-		"  }else{\n" +
-		"    const agent_id=$('agentSel').value;\n" +
-		"    const r=await api('/dispatch','POST',{agent_id,action:$('actSel').value,user:$('userIn').value||'root',params});\n" +
-		"    $('lastOut').textContent=JSON.stringify(r,null,2);\n" +
-		"  }\n" +
-		"  toast('已下发'); setTimeout(loadCmds,1500); $('agentSel').disabled=false; saveRescueTarget();\n" +
+		"  let params=buildParams(); if(params===null)return;\n" +
+		"  try{\n" +
+		"    if($('agentSel').disabled && selectedAgents.size>0){\n" +
+		"      if($('actSel').value==='shell'){ params={command:$('shellCmd').value.trim()}; if(!params.command){alert('请输入命令');return;} }\n" +
+		"      const r=await api('/dispatch_batch','POST',{agent_ids:[...selectedAgents],action:$('actSel').value,user:$('userIn').value.trim()||'root',params});\n" +
+		"      $('lastOut').textContent='批量已下发 '+r.length+' 条:\\n'+JSON.stringify(r,null,2);\n" +
+		"    }else{\n" +
+		"      const agent_id=$('agentSel').value;\n" +
+		"      if(!agent_id){ toast('请选择目标主机'); return; }\n" +
+		"      if($('actSel').value==='shell'){ params={command:$('shellCmd').value.trim()}; if(!params.command){alert('请输入命令');return;} }\n" +
+		"      const r=await api('/dispatch','POST',{agent_id,action:$('actSel').value,user:$('userIn').value.trim()||'root',params});\n" +
+		"      $('lastOut').textContent=JSON.stringify(r,null,2);\n" +
+		"    }\n" +
+		"    toast('已下发'); setTimeout(loadCmds,1500); $('agentSel').disabled=false; saveRescueTarget();\n" +
+		"  }catch(e){ toast(e.message||'下发失败'); }\n" +
 		"}\n" +
 		"function buildAgentFilters(){ const fa=$('cmdAgentFilter'); if(!fa)return; fa.innerHTML='<option value=\"\">全部主机</option>'; agents.forEach(a=>{const o=document.createElement('option');o.value=a.agent_id;o.textContent=a.hostname||a.agent_id;fa.appendChild(o);}); }\n" +
 		"async function loadCmds(){\n" +
-		"  const aid=$('cmdAgentFilter').value;\n" +
-		"  let p=new URLSearchParams({page:cmdPage,page_size:cmdSize}); if(aid)p.set('agent_id',aid);\n" +
+		"  const aid=$('cmdAgentFilter').value; const act=$('cmdActionFilter')?$('cmdActionFilter').value:'';\n" +
+		"  let p=new URLSearchParams({page:cmdPage,page_size:cmdSize}); if(aid)p.set('agent_id',aid); if(act)p.set('action',act);\n" +
 		"  const j=await api('/commands?'+p.toString());\n" +
 		"  cmds=pageItems(j); const m=pageMeta(j); cmdTotal=m.total; cmdPages=m.pages;\n" +
 		"  const tb=$('cmdBody'); tb.innerHTML='';\n" +
@@ -451,12 +491,13 @@ func uiJS() string {
 		"async function createUser(){\n" +
 		"  const u=$('uNewName').value.trim(), pw=$('uNewPw').value, role=$('uNewRole').value;\n" +
 		"  if(!u||!pw){ toast('用户名和口令必填'); return; }\n" +
+		"  if(pw.length<8){ toast('口令至少 8 位'); return; }\n" +
 		"  const r=await fetch('/api/users',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw,role:role})});\n" +
 		"  const j=await r.json(); if(!r.ok){ toast(j.error||'创建失败'); return; }\n" +
 		"  $('uNewName').value=''; $('uNewPw').value=''; toast('已创建'); loadUsers();\n" +
 		"}\n" +
 		"async function userPwPrompt(u){\n" +
-		"  const pw=prompt('为 '+u+' 设置新口令:'); if(pw===null)return; if(pw.length<6){ toast('口令至少 6 位'); return; }\n" +
+		"  const pw=prompt('为 '+u+' 设置新口令:'); if(pw===null)return; if(pw.length<8){ toast('口令至少 8 位'); return; }\n" +
 		"  const r=await fetch('/api/users/password',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw})});\n" +
 		"  const j=await r.json(); if(!r.ok){ toast(j.error||'改密失败'); return; } toast('已改密');\n" +
 		"}\n" +
@@ -483,8 +524,17 @@ func uiJS() string {
 		"  if(b.dataset.tab==='tokens')loadTokens();\n" +
 		"  if(b.dataset.tab==='rescue')refreshRescueSelect();\n" +
 		"  if(b.dataset.tab==='users')loadUsers();\n" +
+		"  if(b.dataset.tab==='shell'){loadShellPolicy();loadShellRules();}\n" +
 		"});\n" +
 		// ---------- 启动 ----------
 		"if(TOK){ ROLE=localStorage.getItem('gk_role')||'admin'; fetch('/api/me',{headers:{'Authorization':'Bearer '+TOK}}).then(r=>{if(!r.ok){showLogin();}else enterApp();}).catch(showLogin); } else { showLogin(); }\n" +
+		"function authHeaders(){ return {'Authorization':'Bearer '+TOK}; }\n" +
+		"function loadShellPolicy(){ fetch('/api/shell/policy',{headers:authHeaders()}).then(r=>r.json()).then(d=>{$('shellEnabled').checked=d.enabled;$('shellTimeout').value=d.timeout;$('shellMaxOutput').value=d.max_output;$('shellMatchMode').value=d.match_mode||'legacy';}).catch(e=>toast('加载策略失败: '+e.message)); }\n" +
+		"function saveShellPolicy(){ api('/shell/policy','POST',{enabled:$('shellEnabled').checked,timeout:parseInt($('shellTimeout').value),max_output:parseInt($('shellMaxOutput').value),match_mode:$('shellMatchMode').value}).then(()=>toast('保存成功')).catch(e=>toast('保存失败: '+e.message)); }\n" +
+		"function loadShellRules(){ fetch('/api/shell/rules',{headers:authHeaders()}).then(r=>r.json()).then(rs=>{ const wl=[],bl=[]; (rs||[]).forEach(r=>{(r.type==='whitelist'?wl:bl).push(r);}); renderShellTable('wlTable',wl,'whitelist'); renderShellTable('blTable',bl,'blacklist'); }).catch(e=>toast('加载规则失败: '+e.message)); }\n" +
+		"function renderShellTable(tid,rules,type){ const tb=$(tid).querySelector('tbody'); tb.innerHTML=''; rules.forEach(r=>{ const tr=document.createElement('tr'); tr.innerHTML='<td>'+esc(r.pattern)+'</td><td>'+esc(r.note||'')+'</td><td><input type=\"checkbox\" '+(r.enabled?'checked':'')+' onchange=\"toggleShellRule('+r.id+',this.checked)\" ></td><td><button onclick=\"delShellRule('+r.id+')\" style=\"color:red\">删除</button></td>'; tb.appendChild(tr); }); }\n" +
+		"function addShellRule(type){ const p=$((type==='whitelist'?'wl':'bl')+'Pattern').value; const n=$((type==='whitelist'?'wl':'bl')+'Note').value; if(!p){toast('请输入模式');return;} api('/shell/rules','POST',{type:type,pattern:p,note:n}).then(()=>{loadShellRules(); $((type==='whitelist'?'wl':'bl')+'Pattern').value=''; $((type==='whitelist'?'wl':'bl')+'Note').value=''; toast('已添加');}).catch(e=>toast('添加失败: '+e.message)); }\n" +
+		"function toggleShellRule(id,en){ api('/shell/rules/update','POST',{id:id,pattern:'',note:'',enabled:en}).then(()=>loadShellRules()).catch(e=>toast('更新失败: '+e.message)); }\n" +
+		"function delShellRule(id){ if(!confirm('确认删除?'))return; api('/shell/rules/delete','POST',{id:id}).then(()=>{loadShellRules(); toast('已删除');}).catch(e=>toast('删除失败: '+e.message)); }\n" +
 		"onActChange();\n"
 }

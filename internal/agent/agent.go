@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"gatekeeper/internal/proto"
@@ -63,9 +64,15 @@ func Run(ctx context.Context, opts Options) {
 		if ctx.Err() != nil {
 			return
 		}
+		start := time.Now()
 		err := connectAndServe(ctx, opts)
 		if err != nil {
 			log.Printf("[agent] 连接断开: %v", err)
+		}
+		// 上次连接存活时间超过 ReconnectMax 说明之前的连接是稳定的(非拨号即败),
+		// 下次重连不必再走完整指数退避, 重置到最小值以快速恢复。
+		if time.Since(start) > opts.ReconnectMax {
+			backoff = opts.ReconnectMin
 		}
 		if backoff > opts.ReconnectMax {
 			backoff = opts.ReconnectMax
@@ -112,6 +119,25 @@ func connectAndServe(ctx context.Context, opts Options) error {
 	}
 	defer conn.Close()
 
+	// 读超时: 若在 readDeadline 内未收到任何消息(含 pong), 判定连接已死,
+	// ReadJSON 返回超时错误, 触发上层重连。取心跳的 3 倍, 容忍网络抖动。
+	// 这解决了 server 被 kill -9 / OOM / 宿主机宕机 / 网络静默中断时不发 FIN 导致
+	// ReadJSON 永久阻塞(卡死)的问题——否则只能等 TCP 重传超时(~15min)或 keepalive(~2h)。
+	readDeadline := opts.Heartbeat * 3
+	if readDeadline < 30*time.Second {
+		readDeadline = 30 * time.Second
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
+
+	// 写锁: gorilla/websocket 不允许一连接并发写, 否则帧交错/数据竞争/panic。
+	// 心跳 goroutine 和每条 handleCmd goroutine 的写操作都通过此锁串行化。
+	var writeMu sync.Mutex
+	safeWrite := func(env proto.Envelope) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeJSON(conn, env)
+	}
+
 	hostname, _ := os.Hostname()
 	reg := proto.Envelope{
 		Kind:     proto.KindRegister,
@@ -120,22 +146,26 @@ func connectAndServe(ctx context.Context, opts Options) error {
 		Hostname: hostname,
 		OS:       runtime.GOOS,
 	}
-	if err := writeJSON(conn, reg); err != nil {
+	if err := safeWrite(reg); err != nil {
 		return err
 	}
 
 	pingC := time.NewTicker(opts.Heartbeat)
 	defer pingC.Stop()
+	// connCtx 在 connectAndServe 返回时被 cancel, 用于唤醒可能仍阻塞在 select 上的
+	// ping goroutine, 避免 ticker 已 Stop 但 goroutine 无法退出导致的泄漏。
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	done := make(chan error, 2)
-	go func() { done <- readLoop(conn, opts) }()
+	go func() { done <- readLoop(conn, opts, safeWrite, readDeadline) }()
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-connCtx.Done():
 				return
 			case <-pingC.C:
-				if err := writeJSON(conn, proto.Envelope{Kind: proto.KindPing, AgentID: opts.AgentID, Payload: "ping"}); err != nil {
+				if err := safeWrite(proto.Envelope{Kind: proto.KindPing, AgentID: opts.AgentID, Payload: "ping"}); err != nil {
 					done <- err
 					return
 				}
@@ -151,12 +181,15 @@ func connectAndServe(ctx context.Context, opts Options) error {
 	}
 }
 
-func readLoop(conn *websocket.Conn, opts Options) error {
+func readLoop(conn *websocket.Conn, opts Options, safeWrite func(proto.Envelope) error, readDeadline time.Duration) error {
 	for {
 		var env proto.Envelope
 		if err := conn.ReadJSON(&env); err != nil {
 			return err
 		}
+		// 收到任何消息(pong/ok/cmd)都说明连接活着, 刷新读超时。
+		// server 异常退出不发 FIN 时, 下次 pong 不会到达, readDeadline 到期即触发重连。
+		_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
 		switch env.Kind {
 		case proto.KindOK:
 			log.Printf("[agent] 注册成功，已纳入管理")
@@ -165,19 +198,18 @@ func readLoop(conn *websocket.Conn, opts Options) error {
 		case proto.KindPong:
 			// 心跳回执
 		case proto.KindCmd:
-			go handleCmd(conn, env.Cmd, opts)
+			go handleCmd(conn, env.Cmd, opts, safeWrite)
 		}
 	}
 }
 
-func handleCmd(conn *websocket.Conn, c *proto.Cmd, opts Options) {
+func handleCmd(conn *websocket.Conn, c *proto.Cmd, opts Options, safeWrite func(proto.Envelope) error) {
 	if c == nil {
 		return
 	}
 	log.Printf("[agent] 收到指令 %s action=%s user=%s", c.ID, c.Action, c.User)
 	res := Execute(c)
-	out, _ := json.Marshal(proto.Envelope{Kind: proto.KindResult, AgentID: opts.AgentID, Result: res})
-	_ = conn.WriteMessage(websocket.TextMessage, out)
+	_ = safeWrite(proto.Envelope{Kind: proto.KindResult, AgentID: opts.AgentID, Result: res})
 }
 
 func writeJSON(conn *websocket.Conn, env proto.Envelope) error {
