@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+// reSafeID 只保留字母/数字/点/下划线/连字符，与 server 端 validAgentID 白名单一致。
+var reSafeID = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
 // loadOrCreateAgentID 读取持久化文件；不存在则生成并写入(权限 0600)。
 // path 为空则使用 ~/.gatekeeper/agent_id。
@@ -41,11 +45,13 @@ func loadOrCreateAgentID(path string) (string, error) {
 }
 
 // generateAgentID 生成 hostname-随机 的稳定 id。
+// hostname 中的非白名单字符会被替换为 -，确保与 server 端 validAgentID 兼容。
 func generateAgentID() (string, error) {
 	host, _ := os.Hostname()
 	if host == "" {
 		host = "host"
 	}
+	host = reSafeID.ReplaceAllString(host, "-")
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		return "", err

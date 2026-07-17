@@ -24,6 +24,7 @@ func uiHTML() string {
 		"    <button data-tab=\"rescue\">救&shy;援</button>\n" +
 		"    <button data-tab=\"cmd\">指令历史</button>\n" +
 		"    <button data-tab=\"audit\">审计日志</button>\n" +
+		"    <button data-tab=\"scan\">账户巡检</button>\n" +
 		"    <button data-tab=\"tokens\">Token</button>\n" +
 		"    <button data-tab=\"users\" class=\"admin-only\">用&shy;户</button>\n" +
 		"    <button data-tab=\"shell\" class=\"admin-only\">Shell</button>\n" +
@@ -117,6 +118,17 @@ func uiHTML() string {
 		"    <div class=\"card\"><table class=\"tbl\"><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>详情</th><th>来源IP</th></tr></thead><tbody id=\"auditBody\"></tbody></table>\n" +
 		"      <div class=\"pager\" id=\"auditPager\"></div>\n" +
 		"    </div>\n" +
+		"  </section>\n" +
+		"  <section id=\"tab-scan\" class=\"tab-content hidden\">\n" +
+		"    <div class=\"card\">\n" +
+		"      <div class=\"card-h\"><h3>账户巡检概览</h3><button class=\"ghost\" onclick=\"loadScanSummary()\">刷新</button><button class=\"primary\" style=\"margin-left:8px\" onclick=\"triggerScan()\">立即巡检</button></div>\n" +
+		"      <div class=\"grid4\" id=\"scanSummary\" style=\"margin-top:12px\"></div>\n" +
+		"    </div>\n" +
+		"    <div class=\"card\">\n" +
+		"      <div class=\"card-h\"><h3>巡检明细</h3><div class=\"field\" style=\"margin-left:auto\"><label>状态过滤</label><select id=\"scanStatusFilter\" onchange=\"loadScans()\"><option value=\"\">全部</option><option value=\"expired\">已过期</option><option value=\"password_expired\">密码已过期</option><option value=\"password_expiring\">密码即将过期</option><option value=\"expiring\">账户即将过期</option><option value=\"locked\">锁定</option><option value=\"active\">正常</option><option value=\"unknown\">未知</option></select></div></div>\n" +
+		"      <div class=\"hint\" id=\"scanCount\" style=\"margin-top:8px\"></div>\n" +
+		"    </div>\n" +
+		"    <div class=\"card\"><table class=\"tbl\"><thead><tr><th>主机</th><th>账户</th><th>UID</th><th>状态</th><th>密码最后修改</th><th>密码过期</th><th>账户过期</th><th>最大天数</th><th>告警天数</th><th>扫描时间</th></tr></thead><tbody id=\"scanBody\"></tbody></table></div>\n" +
 		"  </section>\n" +
 		"  <section id=\"tab-tokens\" class=\"tab-content hidden\">\n" +
 		"    <div class=\"card\">\n" +
@@ -471,7 +483,7 @@ func uiJS() string {
 		"}\n" +
 		"async function genToken(){ const r=await api('/tokens','POST',{note:$('tokNote').value, bind_agent_id:$('tokBind').value||''}); $('tokOut').textContent='Token: '+r.token+'\\n备注: '+r.note+(r.bound_agent_id?('\\n绑定: '+r.bound_agent_id):'')+'\\n\\n安装命令:\\n  gatekeeper-agent -server <SERVER> -token '+r.token+'\\n\\n⚠ 此 token 仅显示一次, 请立即保存; 数据库只存哈希。'; toast('已生成, 请立即保存'); tokPage=1; loadTokens(); }\n" +
 		"async function revokeTok(t){ if(!confirm('撤销后该 token 关联的 agent 将被立即踢下线且无法重连, 确定?'))return; await api('/tokens/revoke','POST',{token:t}); toast('已撤销'); loadTokens(); }\n" +
-		"async function deleteTok(t){ if(!confirm('硬删除已撤销的 token? 已绑定 agent 的历史记录会保留但失去对应凭据, 不可恢复, 确定?'))return; const r=await fetch('/api/tokens/delete',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({token:t})}); const j=await r.json(); if(!r.ok){ toast(j.error||'删除失败'); return; } toast('已删除'); loadTokens(); }\n" +
+		"async function deleteTok(t){ if(!confirm('硬删除已撤销的 token? 已绑定 agent 的历史记录会保留但失去对应凭据, 不可恢复, 确定?'))return; try{ const r=await fetch('/api/tokens/delete',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({token:t})}); const j=await r.json(); if(!r.ok){ toast(j.error||'删除失败'); return; } toast('已删除'); loadTokens(); }catch(e){ toast('删除失败: '+e.message); } }\n" +
 		"// ---- 用户管理 ----\n" +
 		"async function loadUsers(){\n" +
 		"  if(ROLE!=='admin')return;\n" +
@@ -492,27 +504,32 @@ func uiJS() string {
 		"  const u=$('uNewName').value.trim(), pw=$('uNewPw').value, role=$('uNewRole').value;\n" +
 		"  if(!u||!pw){ toast('用户名和口令必填'); return; }\n" +
 		"  if(pw.length<8){ toast('口令至少 8 位'); return; }\n" +
-		"  const r=await fetch('/api/users',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw,role:role})});\n" +
-		"  const j=await r.json(); if(!r.ok){ toast(j.error||'创建失败'); return; }\n" +
-		"  $('uNewName').value=''; $('uNewPw').value=''; toast('已创建'); loadUsers();\n" +
+		"  try{\n" +
+		"    const r=await fetch('/api/users',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw,role:role})});\n" +
+		"    const j=await r.json(); if(!r.ok){ toast(j.error||'创建失败'); return; }\n" +
+		"    $('uNewName').value=''; $('uNewPw').value=''; toast('已创建'); loadUsers();\n" +
+		"  }catch(e){ toast('创建失败: '+e.message); }\n" +
 		"}\n" +
 		"async function userPwPrompt(u){\n" +
 		"  const pw=prompt('为 '+u+' 设置新口令:'); if(pw===null)return; if(pw.length<8){ toast('口令至少 8 位'); return; }\n" +
-		"  const r=await fetch('/api/users/password',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw})});\n" +
+		"  try{ const r=await fetch('/api/users/password',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,password:pw})});\n" +
 		"  const j=await r.json(); if(!r.ok){ toast(j.error||'改密失败'); return; } toast('已改密');\n" +
+		"  }catch(e){ toast('改密失败: '+e.message); }\n" +
 		"}\n" +
 		"async function userToggleDisable(u,d){\n" +
-		"  const r=await fetch('/api/users/disable',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,disabled:d})});\n" +
+		"  try{ const r=await fetch('/api/users/disable',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u,disabled:d})});\n" +
 		"  const j=await r.json(); if(!r.ok){ toast(j.error||'操作失败'); return; } toast(d?'已禁用':'已启用'); loadUsers();\n" +
+		"  }catch(e){ toast('操作失败: '+e.message); }\n" +
 		"}\n" +
 		"async function userDelete(u){\n" +
 		"  if(!confirm('硬删除用户 '+u+'? 不可恢复, 确定?'))return;\n" +
-		"  const r=await fetch('/api/users/delete',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u})});\n" +
+		"  try{ const r=await fetch('/api/users/delete',{method:'POST',headers:{'Authorization':'Bearer '+TOK,'Content-Type':'application/json'},body:JSON.stringify({username:u})});\n" +
 		"  const j=await r.json(); if(!r.ok){ toast(j.error||'删除失败'); return; } toast('已删除'); loadUsers();\n" +
+		"  }catch(e){ toast('删除失败: '+e.message); }\n" +
 		"}\n" +
 		// ---------- 实时事件 ----------
 		"let es;\n" +
-		"function connectEvents(){ if(es)return; try{ es=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ui/events?t='+encodeURIComponent(TOK)); es.onmessage=ev=>{ let m; try{m=JSON.parse(ev.data);}catch(e){return;} if(m.type==='result'||m.type==='agent_online'||m.type==='agent_offline'){ loadAgents(); loadCmds(); } }; es.onclose=()=>{ es=null; setTimeout(connectEvents,3000); }; }catch(e){} }\n" +
+		"function connectEvents(){ if(es)return; try{ es=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ui/events?t='+encodeURIComponent(TOK)); es.onmessage=ev=>{ let m; try{m=JSON.parse(ev.data);}catch(e){return;} if(m.type==='result'||m.type==='agent_online'||m.type==='agent_offline'){ loadAgents(); loadCmds(); } if(m.type==='account_scan_updated'){ loadScanSummary(); loadScans(); } }; es.onclose=()=>{ es=null; setTimeout(connectEvents,3000); }; }catch(e){} }\n" +
 		// ---------- tabs ----------
 		"document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{\n" +
 		"  document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));\n" +
@@ -525,6 +542,7 @@ func uiJS() string {
 		"  if(b.dataset.tab==='rescue')refreshRescueSelect();\n" +
 		"  if(b.dataset.tab==='users')loadUsers();\n" +
 		"  if(b.dataset.tab==='shell'){loadShellPolicy();loadShellRules();}\n" +
+		"  if(b.dataset.tab==='scan'){loadScanSummary();loadScans();}\n" +
 		"});\n" +
 		// ---------- 启动 ----------
 		"if(TOK){ ROLE=localStorage.getItem('gk_role')||'admin'; fetch('/api/me',{headers:{'Authorization':'Bearer '+TOK}}).then(r=>{if(!r.ok){showLogin();}else enterApp();}).catch(showLogin); } else { showLogin(); }\n" +
@@ -536,5 +554,15 @@ func uiJS() string {
 		"function addShellRule(type){ const p=$((type==='whitelist'?'wl':'bl')+'Pattern').value; const n=$((type==='whitelist'?'wl':'bl')+'Note').value; if(!p){toast('请输入模式');return;} api('/shell/rules','POST',{type:type,pattern:p,note:n}).then(()=>{loadShellRules(); $((type==='whitelist'?'wl':'bl')+'Pattern').value=''; $((type==='whitelist'?'wl':'bl')+'Note').value=''; toast('已添加');}).catch(e=>toast('添加失败: '+e.message)); }\n" +
 		"function toggleShellRule(id,en){ api('/shell/rules/update','POST',{id:id,pattern:'',note:'',enabled:en}).then(()=>loadShellRules()).catch(e=>toast('更新失败: '+e.message)); }\n" +
 		"function delShellRule(id){ if(!confirm('确认删除?'))return; api('/shell/rules/delete','POST',{id:id}).then(()=>{loadShellRules(); toast('已删除');}).catch(e=>toast('删除失败: '+e.message)); }\n" +
+		// ---- 账户巡检 ----
+		"let scanData=[];\n" +
+		"function loadScans(){ fetch('/api/account_scans?status='+(encodeURIComponent($('scanStatusFilter').value)),{headers:authHeaders()}).then(r=>r.json()).then(d=>{scanData=d||[];$('scanCount').innerText='共 '+scanData.length+' 条'; const tb=$('scanBody'); tb.innerHTML=''; scanData.forEach(a=>{const tr=document.createElement('tr');" +
+		"tr.innerHTML='<td>'+esc(a.agent_id)+'</td><td>'+esc(a.username)+'</td><td>'+a.uid+'</td><td><span style=\"padding:2px 8px;border-radius:4px;font-size:12px;color:#fff;background:'+scanStatusColor(a.status)+'\">'+scanStatusText(a.status)+'</span></td><td>'+esc(a.last_change||'—')+'</td><td>'+esc(a.password_expire||'—')+'</td><td>'+esc(a.expire_date||'—')+'</td><td>'+a.max_days+'</td><td>'+a.warn_days+'</td><td>'+esc(new Date((a.scan_ts||0)*1000).toLocaleString()) +'</td>';" +
+		"tb.appendChild(tr);});}).catch(e=>toast('加载巡检数据失败: '+e.message)); }\n" +
+		"function loadScanSummary(){ fetch('/api/account_scans/summary',{headers:authHeaders()}).then(r=>r.json()).then(s=>{const items=[{l:'总计',v:s.total||0,c:'#666'},{l:'正常',v:s.active||0,c:'#22c55e'},{l:'即将过期',v:(s.expiring||0)+(s.password_expiring||0),c:'#f59e0b'},{l:'已过期',v:(s.expired||0)+(s.password_expired||0),c:'#ef4444'},{l:'锁定',v:s.locked||0,c:'#8b5cf6'},{l:'未知',v:s.unknown||0,c:'#94a3b8'}];" +
+		"$('scanSummary').innerHTML=items.map(i=>'<div class=\"stat\" style=\"text-align:center;padding:12px;border:1px solid #e5e7eb;border-radius:8px\"><div style=\"font-size:24px;font-weight:700;color:'+i.c+'\">'+i.v+'</div><div style=\"font-size:12px;color:#6b7280\">'+i.l+'</div></div>').join('');}).catch(e=>toast('加载概览失败: '+e.message)); }\n" +
+		"function triggerScan(){ const id=prompt('输入主机 agent_id (留空扫描全部在线主机)',''); if(id===null)return; api('/account_scans/trigger','POST',{agent_id:id||''}).then(d=>toast('已向 '+d.accepted+' 台主机下发巡检指令')).catch(e=>toast('下发失败: '+e.message)); }\n" +
+		"function scanStatusColor(s){switch(s){case'active':return'#22c55e';case'expired':case'password_expired':return'#ef4444';case'password_expiring':case'expiring':return'#f59e0b';case'locked':return'#8b5cf6';default:return'#94a3b8';}}\n" +
+		"function scanStatusText(s){switch(s){case'active':return'正常';case'expired':return'账户过期';case'password_expired':return'密码过期';case'password_expiring':return'密码将过期';case'expiring':return'即将过期';case'locked':return'锁定';default:return'未知';}}\n" +
 		"onActChange();\n"
 }

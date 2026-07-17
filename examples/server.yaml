@@ -3,6 +3,27 @@
 #   ./gatekeeper.yaml | ~/.gatekeeper/gatekeeper.yaml | /etc/gatekeeper/gatekeeper.yaml
 # 也可用 -config <path> 显式指定。命令行 flag 与同名环境变量会覆盖本文件。
 
+# ---- 字段校验规则 ----
+# 为防止特殊字符破坏 session 解析(session 格式 "username|role|expires")、
+# LIKE 通配符注入、以及存储滥用，所有用户输入均有以下白名单/长度限制:
+#
+#   字段              格式限制                              最大长度
+#   ───────────────   ──────────────────────────────────   ────────
+#   username          仅 [a-zA-Z0-9_-]                     64
+#   agent_id          仅 [a-zA-Z0-9._-]                    128
+#   password          任意可见字符(需>=8位)                  -
+#   shell pattern     任意可见字符                          500
+#   shell rule note   任意字符                              256
+#   token note        任意字符                              256
+#   token bind_aid    同 agent_id                           128
+#   dispatch user     任意字符                              64
+#   agent tags        每项任意, 最多 20 项                   -
+#   agent notes       任意字符                              256
+#   batch agent_ids   每项同 agent_id, 最多 100 项          -
+#
+# 超出限制时 API 返回 400 Bad Request; 格式不符同样拒绝。
+# 这些限制同时保护了数据库 LIKE 查询和 session 值的 | 分隔符解析。
+
 # 监听地址。生产建议内网 + 443 端口套 TLS。
 listen: ":8443"
 

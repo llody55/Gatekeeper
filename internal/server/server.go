@@ -27,6 +27,7 @@ type Server struct {
 	bindBootstrapToken bool          // 是否把首次被注册的 bootstrap token 自动绑定到该 agent_id
 	retentionMinDays   int           // YAML 配置的留存下限天数, UI/DB 不得低于此值
 	sessionTTL         time.Duration // 管理端会话有效期; 默认 12h
+	heartbeatTimeout   time.Duration // agent 心跳超时; 用于 readPump 读超时兜底
 	shellEnabled       bool          // shell action 是否启用
 	shellTimeout       time.Duration // shell 执行超时
 	shellMaxOutput     int           // shell 输出截断字节数
@@ -36,10 +37,10 @@ type Server struct {
 
 // Shell 匹配模式常量。
 const (
-	ShellMatchLegacy      = "legacy"       // 当前模式: * 匹配任意字符(含元字符)
+	ShellMatchLegacy      = "legacy"       // 老模式: * 匹配任意字符(含元字符), 不安全, 仅兼容
 	ShellMatchPermissive  = "permissive"   // 允许所有: 跳过黑白名单检查
 	ShellMatchStrictChars = "strict_chars" // 拒元字符: 命令含 ;|& 等直接拒绝
-	ShellMatchStrictGlob  = "strict_glob"  // 严格通配: * 不匹配元字符, 精确规则允许元字符
+	ShellMatchStrictGlob  = "strict_glob"  // 严格通配: * 不匹配元字符, 精确规则允许元字符 [默认推荐]
 )
 
 // SetShellConfig 注入 shell 策略配置。
@@ -74,7 +75,7 @@ func validShellMatchMode(m string) string {
 	case ShellMatchLegacy, ShellMatchPermissive, ShellMatchStrictChars, ShellMatchStrictGlob:
 		return m
 	default:
-		return ShellMatchLegacy
+		return ShellMatchStrictGlob
 	}
 }
 
@@ -221,12 +222,12 @@ func globMatchStrict(pattern, s string) bool {
 }
 
 // New 构造 Server；trustedProxies 为 CIDR 字符串列表，"any" 表示信任所有。
-func New(s *Store, trustedProxies []string, bindBootstrapToken bool, retentionMinDays int, sessionTTL time.Duration) *Server {
+func New(s *Store, trustedProxies []string, bindBootstrapToken bool, retentionMinDays int, sessionTTL time.Duration, heartbeatTimeout time.Duration) *Server {
 	if sessionTTL <= 0 {
 		sessionTTL = 12 * time.Hour
 	}
 	srv := &Server{Store: s, sessions: map[string]*Session{}, uiHub: newUIHub(),
-		bindBootstrapToken: bindBootstrapToken, retentionMinDays: retentionMinDays, sessionTTL: sessionTTL}
+		bindBootstrapToken: bindBootstrapToken, retentionMinDays: retentionMinDays, sessionTTL: sessionTTL, heartbeatTimeout: heartbeatTimeout}
 	for _, c := range trustedProxies {
 		c = strings.TrimSpace(c)
 		if c == "" {
@@ -309,6 +310,11 @@ func (s *Server) AgentWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing token/id", http.StatusUnauthorized)
 		return
 	}
+	// agent_id 格式校验: 防止超长或含特殊字符的 ID 写入 DB/内存 map 造成滥用。
+	if ok, msg := validAgentID(agentID); !ok {
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
 	// 绑定校验: token 必须存在且未撤销; 若已绑定到别的 agent_id 则拒绝(防冒名)。
 	bound, unbound, boundTo, err := s.Store.CheckTokenBindAgent(token, agentID)
 	if err != nil {
@@ -327,7 +333,8 @@ func (s *Server) AgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 	sess := &Session{AgentID: agentID, Conn: conn, send: make(chan proto.Envelope, 64), srv: s}
 
-	// 等待 register 帧
+	// 等待 register 帧 (设 30s 超时防止恶意连接不发帧导致 goroutine 泄漏)
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	var reg proto.Envelope
 	if err := conn.ReadJSON(&reg); err != nil {
 		conn.Close()
@@ -384,6 +391,112 @@ func (s *Server) KickSession(agentID string) bool {
 	return ok
 }
 
+// ---- 账户巡检扫描 ----
+
+// handleScanResult 解析 scan_accounts 的 JSON 输出, 写入 account_scans 表。
+func (s *Server) handleScanResult(agentID, output string) {
+	var accounts []AccountScanRow
+	if err := json.Unmarshal([]byte(output), &accounts); err != nil {
+		log.Printf("[server] 解析 %s 的 scan_accounts 结果失败: %v", agentID, err)
+		return
+	}
+	if err := s.Store.UpsertAccountScan(agentID, accounts); err != nil {
+		log.Printf("[server] 存储 %s 的账户扫描结果失败: %v", agentID, err)
+		return
+	}
+	// 向 UI 推送巡检更新事件
+	s.uiHub.Broadcast(map[string]any{
+		"type":     "account_scan_updated",
+		"agent_id": agentID,
+		"count":    len(accounts),
+	})
+	log.Printf("[server] 已接收 %s 的账户巡检结果: %d 个账户", agentID, len(accounts))
+}
+
+// TriggerAccountScan 触发对指定 agent 或全部在线 agent 的账户巡检。
+// 返回成功接受的 agent 数量。
+func (s *Server) TriggerAccountScan(targetAgentID string) int {
+	cmdID := "scan-" + time.Now().Format("20060102150405") + randomHex(4)
+	accepted := 0
+	if targetAgentID != "" {
+		// 单个 agent
+		c := &StoredCmd{
+			ID: cmdID, AgentID: targetAgentID, Action: proto.ActionScanAccounts,
+			Params: map[string]string{"min_uid": "0"}, CreatedBy: "system",
+		}
+		_ = s.Store.SaveCmd(c)
+		if s.Send(targetAgentID, proto.Envelope{
+			Kind: proto.KindCmd,
+			Cmd:  &proto.Cmd{ID: cmdID, Action: proto.ActionScanAccounts, Params: map[string]string{"min_uid": "0"}},
+		}) {
+			accepted = 1
+		}
+	} else {
+		// 全部在线 agent
+		s.mu.RLock()
+		ids := make([]string, 0, len(s.sessions))
+		for id := range s.sessions {
+			ids = append(ids, id)
+		}
+		s.mu.RUnlock()
+		for _, id := range ids {
+			subCmdID := cmdID + "-" + id
+			c := &StoredCmd{
+				ID: subCmdID, AgentID: id, Action: proto.ActionScanAccounts,
+				Params: map[string]string{"min_uid": "0"}, CreatedBy: "system",
+			}
+			_ = s.Store.SaveCmd(c)
+			if s.Send(id, proto.Envelope{
+				Kind: proto.KindCmd,
+				Cmd:  &proto.Cmd{ID: subCmdID, Action: proto.ActionScanAccounts, Params: map[string]string{"min_uid": "0"}},
+			}) {
+				accepted++
+			}
+		}
+	}
+	return accepted
+}
+
+// StartAccountScanScheduler 启动定时账户巡检 goroutine, 需在独立 goroutine 中调用。
+// stopCh 关闭时退出。
+func (s *Server) StartAccountScanScheduler(interval time.Duration, stopCh <-chan struct{}) {
+	log.Printf("[server] 账户巡检调度器已启动, 间隔 %v", interval)
+	// 启动后延迟 30s 首次扫描, 给所有 agent 重连时间
+	select {
+	case <-stopCh:
+		return
+	case <-time.After(30 * time.Second):
+	}
+	for {
+		log.Printf("[server] 账户巡检: 开始扫描 %d 个在线 agent", len(s.SessionsIDs()))
+		s.TriggerAccountScan("")
+		select {
+		case <-stopCh:
+			log.Printf("[server] 账户巡检调度器已停止")
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+// SessionsIDs 返回当前所有在线 agent 的 id 列表。
+func (s *Server) SessionsIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.sessions))
+	for id := range s.sessions {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// randomHex 生成 n 字节随机数的 hex 编码。
+func randomHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func (s *Server) addSession(sess *Session) {
 	s.mu.Lock()
 	if old := s.sessions[sess.AgentID]; old != nil {
@@ -435,7 +548,17 @@ func (s *Session) writePump() {
 
 func (s *Session) readPump() {
 	defer s.Conn.Close()
+
+	// 计算读超时: agent 心跳超时 * 3, 容忍间歇网络抖动的同时保证静默断连能被及时检测。
+	// 默认 heartbeatTimeout=90s → deadline=270s, 与 agent 端 readDeadline 设计对称。
+	hb := s.srv.heartbeatTimeout
+	if hb <= 0 {
+		hb = 90 * time.Second
+	}
+	deadline := hb * 3
+
 	for {
+		_ = s.Conn.SetReadDeadline(time.Now().Add(deadline))
 		var env proto.Envelope
 		if err := s.Conn.ReadJSON(&env); err != nil {
 			return
@@ -451,6 +574,12 @@ func (s *Session) readPump() {
 					Err:    env.Result.Err,
 					OK:     env.Result.OK,
 				})
+				// 特殊处理: scan_accounts 的返回结果存入 account_scans 表
+				if cmd, _ := s.srv.Store.GetCmd(env.Result.CmdID); cmd != nil && cmd.Action == proto.ActionScanAccounts {
+					if env.Result.OK && env.Result.Output != "" {
+						s.srv.handleScanResult(s.AgentID, env.Result.Output)
+					}
+				}
 				s.srv.uiHub.Broadcast(map[string]any{
 					"type":     "result",
 					"cmd_id":   env.Result.CmdID,

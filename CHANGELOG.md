@@ -3,6 +3,48 @@
 本文件记录每个发行版的关键变更。版本号与仓库根目录 `VERSION` 文件一致。
 发版流程: 改 `VERSION` → `make build`（Makefile 通过 `-ldflags -X` 自动注入到二进制）→ 更新本文件。
 
+## v0.7.0 (2026-07-14)
+
+本版聚焦"稳定性加固 + 账户巡检自动化", 新增定时扫描主机账户过期状态并上报平台展示, 同时修复多项影响系统稳定性的问题。
+
+### 新增
+
+- **账户巡检功能**：
+  - 新增 `scan_accounts` 动作，agent 扫描主机上所有可登录账户的过期/密码状态并上报 server。
+  - 扫描逻辑：读取 `/etc/passwd` → 按 shell 过滤不可登录用户（nologin/false/sync 等）→ 对每个用户执行 `chage -l` 解析过期信息 → 自动判定 6 种状态（active / password_expiring / expiring / expired / password_expired / locked）。
+  - 扫描范围：默认包含所有可登录账户（含 root），不再仅限 UID ≥ 1000，通过 `min_uid` 参数可自定义下限。
+  - Server 端 `account_scans` 表存储巡检结果，`agent_id + username` 唯一约束确保每个主机每个用户只保留最新一条。
+  - **定时调度器**：默认每 6 小时自动扫描全部在线 agent，启动后延迟 30s 首次扫描。间隔可通过 DB settings `account_scan_interval_hours` 动态调整（最少 1 小时）。
+  - **手动触发**：`POST /api/account_scans/trigger`（admin/operator），可指定单个 agent 或全部在线 agent。
+  - **查询 API**：`GET /api/account_scans?agent_id=&status=`、`GET /api/account_scans/summary`。
+  - **UI 巡检面板**：新增"账户巡检"Tab，含概览统计卡片（总计/正常/即将过期/已过期/锁定/未知）、明细表格（按状态过滤）、手动巡检按钮、WebSocket 实时刷新。
+- **优雅关闭 (Graceful Shutdown)**：
+  - Server 监听 SIGTERM/SIGINT 信号，收到后先关闭 HTTP Server（15s 超时完成在途请求和 WebSocket 关闭），再关闭数据库，安全退出。
+  - 避免了之前直接 kill 导致活跃 WebSocket 连接立即切断、pending 命令回执丢失的问题。
+- **Store 层测试**：
+  - 新增 `store_test.go`，包含 22 个测试用例，覆盖 tokens / agents / commands / audit / users / settings / shell_rules / 数据清理 / LIKE 注入防护全链路。
+
+### 修复
+
+- **无法清空 agent 备注**：`handleAgentUpdate` / `handleAgentUpdateID` 中 `Notes` 字段使用 `string` 类型，空字符串 `""` 与"未传"无法区分，导致管理员无法清空备注。改为 `*string` 指针类型：`nil`=不改，`""`=清空。
+- **DeleteToken 静默成功**：删除不存在的 token 时返回 `nil`（成功），调用方无法区分"token 不存在"和"删除成功"。改为返回 `"token not found"` 错误。
+- **Shell 默认匹配模式不安全**：默认 `match_mode` 为 `legacy`，该模式下 `*` 通配符可匹配 shell 元字符（如 `;`、`|`），白名单 `systemctl restart *` 可被 `systemctl restart x; rm -rf /` 绕过。默认值改为 `strict_glob`，`*` 不匹配元字符，精确规则才允许元字符。
+- **自动生成 token 的安全风险**：首次启动时自动生成 `auto-bootstrap` token 并将明文打印到日志和审计记录中，存在泄露风险且与 UI 手动创建的 token 长度不一致。移除自动生成逻辑，未配置 token 时仅打印提示，要求管理员通过 UI 或 API 手动创建。
+
+### 安全
+
+- **Shell 默认模式升级**：`legacy` → `strict_glob`，消除通配符白名单被 shell 元字符绕过的隐患。
+- **移除自动 token 生成**：不再将明文 token 写入启动日志和审计记录，降低凭证泄露风险。
+- **优雅关闭**：避免 kill 信号导致数据库写入中断或 WebSocket 连接异常断开。
+
+### 配置
+
+- 新增 DB settings 键 `account_scan_interval_hours`（默认 6，最少 1），可动态调整巡检间隔无需重启。
+- `match_mode` 默认值从 `legacy` 改为 `strict_glob`，已有配置不受影响（配置优先）。
+- 移除自动 token 生成行为，首次部署需通过 UI 或配置文件 `agent.bootstrap_token` 提供 token。
+
+---
+
 ## v0.6.0 (2026-07-12)
 
 本版聚焦"通用 shell 下发 + agent 连接健壮性 + 多项 UI/功能修复", 是面向日常运维场景的关键更新。

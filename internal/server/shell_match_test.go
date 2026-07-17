@@ -36,7 +36,7 @@ func TestGlobMatchLegacy(t *testing.T) {
 	}{
 		{"systemctl restart *", "systemctl restart nginx", true},
 		{"systemctl restart *", "systemctl restart x; rm -rf /", true}, // legacy 允许
-		{"ps *", "ps aux | grep nginx", true}, // legacy 允许
+		{"ps *", "ps aux | grep nginx", true},                          // legacy 允许
 		{"systemctl status *", "systemctl status docker", true},
 		{"cat /etc/*", "cat /etc/nginx/nginx.conf", true},
 		{"exact", "exact", true},
@@ -87,8 +87,8 @@ func TestValidShellMatchMode(t *testing.T) {
 		{"permissive", "permissive"},
 		{"strict_chars", "strict_chars"},
 		{"strict_glob", "strict_glob"},
-		{"unknown", "legacy"},
-		{"", "legacy"},
+		{"unknown", "strict_glob"},
+		{"", "strict_glob"},
 	}
 	for _, tt := range tests {
 		got := validShellMatchMode(tt.input)

@@ -108,6 +108,26 @@ CREATE INDEX IF NOT EXISTS idx_shell_rules_type ON shell_rules(type, enabled);
 	// 老库兼容: 若 tokens 缺列则补上(忽略重复列报错)。
 	_, _ = s.db.Exec(`ALTER TABLE tokens ADD COLUMN token_prefix TEXT`)
 	_, _ = s.db.Exec(`ALTER TABLE tokens ADD COLUMN bound_agent_id TEXT`)
+
+	// v0.7: 账户巡检记录表
+	s.db.Exec(`CREATE TABLE IF NOT EXISTS account_scans (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		agent_id        TEXT NOT NULL,
+		username        TEXT NOT NULL,
+		uid             INTEGER NOT NULL DEFAULT 0,
+		status          TEXT NOT NULL DEFAULT 'unknown',
+		last_change     TEXT NOT NULL DEFAULT '',
+		expire_date     TEXT NOT NULL DEFAULT '',
+		password_expire TEXT NOT NULL DEFAULT '',
+		inactive_days   INTEGER NOT NULL DEFAULT 0,
+		min_days        INTEGER NOT NULL DEFAULT 0,
+		max_days        INTEGER NOT NULL DEFAULT 0,
+		warn_days       INTEGER NOT NULL DEFAULT 0,
+		scan_ts         INTEGER NOT NULL DEFAULT 0
+	)`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_account_scans_agent ON account_scans(agent_id)`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_account_scans_status ON account_scans(status)`)
+	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_scans_unique ON account_scans(agent_id, username)`)
 	return nil
 }
 
@@ -190,7 +210,7 @@ func (s *Store) DeleteToken(tokenOrHash string) error {
 	var revoked int
 	err := s.db.QueryRow(`SELECT revoked FROM tokens WHERE token=?`, h).Scan(&revoked)
 	if err == sql.ErrNoRows {
-		return nil
+		return fmt.Errorf("token not found")
 	}
 	if err != nil {
 		return err
@@ -862,10 +882,15 @@ func (s *Store) SettingSet(k, v string) error {
 
 // DeleteSessionsByActor 清除指定用户的所有活跃会话。
 // 用于改密/禁用/删除用户时即时吊销既有 session, 防止被禁用户继续操作。
+// 安全: 使用 escapeLike 转义通配符，防止 username 中的 %/_ 扩大匹配范围；
+// 同时通过应用层 validUsername 白名单已杜绝 | 字符，确保 LIKE 精确匹配。
 func (s *Store) DeleteSessionsByActor(actor string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT k FROM settings WHERE k LIKE 'session:%' AND v LIKE ?`, actor+"|%")
+	// v 格式: "username|role|expires"，用 LIKE "actor|%" 匹配以 actor| 开头的行。
+	// escapeLike 转义 actor 中的 % 和 _，防止 LIKE 通配符注入。
+	rows, err := s.db.Query(`SELECT k FROM settings WHERE k LIKE 'session:%' AND v LIKE ? ESCAPE '\'`,
+		escapeLike(actor)+"|%")
 	if err != nil {
 		return
 	}
@@ -880,6 +905,15 @@ func (s *Store) DeleteSessionsByActor(actor string) {
 	for _, k := range keys {
 		_, _ = s.db.Exec(`DELETE FROM settings WHERE k=?`, k)
 	}
+}
+
+// escapeLike 转义 SQLite LIKE 中的通配符 % 和 _，防止 LIKE 注入。
+// 使用 \ 作为 ESCAPE 字符，需与查询中的 ESCAPE '\' 配合。
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }
 
 // ---- 用户与 RBAC ----
@@ -1255,4 +1289,131 @@ func (s *Store) ShellSettingGet(key string, defVal string) string {
 		return defVal
 	}
 	return v
+}
+
+// ---- 账户巡检(account_scans) ----
+
+// AccountScanRow 表示一条账户巡检记录。
+type AccountScanRow struct {
+	ID             int64  `json:"id"`
+	AgentID        string `json:"agent_id"`
+	Username       string `json:"username"`
+	UID            int    `json:"uid"`
+	Status         string `json:"status"`
+	LastChange     string `json:"last_change"`
+	ExpireDate     string `json:"expire_date"`
+	PasswordExpire string `json:"password_expire"`
+	InactiveDays   int    `json:"inactive_days"`
+	MinDays        int    `json:"min_days"`
+	MaxDays        int    `json:"max_days"`
+	WarnDays       int    `json:"warn_days"`
+	ScanTs         int64  `json:"scan_ts"`
+}
+
+// UpsertAccountScan 批量写入/更新账户扫描结果。agent_id+username 唯一约束确保同一主机同一用户只保留最新一条。
+func (s *Store) UpsertAccountScan(agentID string, accounts []AccountScanRow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	for _, a := range accounts {
+		a.AgentID = agentID
+		a.ScanTs = now
+		_, err := s.db.Exec(`INSERT INTO account_scans(agent_id, username, uid, status, last_change, expire_date, password_expire, inactive_days, min_days, max_days, warn_days, scan_ts)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(agent_id, username) DO UPDATE SET
+				uid=excluded.uid, status=excluded.status, last_change=excluded.last_change,
+				expire_date=excluded.expire_date, password_expire=excluded.password_expire,
+				inactive_days=excluded.inactive_days, min_days=excluded.min_days,
+				max_days=excluded.max_days, warn_days=excluded.warn_days, scan_ts=excluded.scan_ts`,
+			a.AgentID, a.Username, a.UID, a.Status, a.LastChange, a.ExpireDate,
+			a.PasswordExpire, a.InactiveDays, a.MinDays, a.MaxDays, a.WarnDays, now)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListAccountScans 返回指定 agent 的账户扫描结果, 可按 status 过滤。
+func (s *Store) ListAccountScans(agentID, statusFilter string) ([]AccountScanRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := `SELECT id, agent_id, username, uid, status, last_change, expire_date,
+		password_expire, inactive_days, min_days, max_days, warn_days, scan_ts
+		FROM account_scans`
+	args := []interface{}{}
+	cond := ""
+	if agentID != "" {
+		cond = " WHERE agent_id=?"
+		args = append(args, agentID)
+	}
+	if statusFilter != "" {
+		if cond == "" {
+			cond = " WHERE status=?"
+		} else {
+			cond += " AND status=?"
+		}
+		args = append(args, statusFilter)
+	}
+	q += cond + " ORDER BY agent_id, username"
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountScanRow
+	for rows.Next() {
+		var r AccountScanRow
+		if err := rows.Scan(&r.ID, &r.AgentID, &r.Username, &r.UID, &r.Status,
+			&r.LastChange, &r.ExpireDate, &r.PasswordExpire,
+			&r.InactiveDays, &r.MinDays, &r.MaxDays, &r.WarnDays, &r.ScanTs); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// AccountScanSummary 返回全局巡检摘要: 各类状态的账户数量。
+type AccountScanSummary struct {
+	Total            int `json:"total"`
+	Active           int `json:"active"`
+	Expired          int `json:"expired"`
+	PasswordExpired  int `json:"password_expired"`
+	PasswordExpiring int `json:"password_expiring"`
+	Expiring         int `json:"expiring"`
+	Locked           int `json:"locked"`
+	Unknown          int `json:"unknown"`
+}
+
+// GetAccountScanSummary 返回全局账户状态汇总。
+func (s *Store) GetAccountScanSummary() (AccountScanSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var sum AccountScanSummary
+	count := func(status string) int {
+		var n int
+		s.db.QueryRow(`SELECT COUNT(*) FROM account_scans WHERE status=?`, status).Scan(&n)
+		return n
+	}
+	sum.Active = count("active")
+	sum.Expired = count("expired")
+	sum.PasswordExpired = count("password_expired")
+	sum.PasswordExpiring = count("password_expiring")
+	sum.Expiring = count("expiring")
+	sum.Locked = count("locked")
+	sum.Unknown = count("unknown")
+	sum.Total = sum.Active + sum.Expired + sum.PasswordExpired + sum.PasswordExpiring + sum.Expiring + sum.Locked + sum.Unknown
+	return sum, nil
+}
+
+// CleanAccountScans 清理早于 cutoff 的巡检记录。
+func (s *Store) CleanAccountScans(cutoff time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, err := s.db.Exec(`DELETE FROM account_scans WHERE scan_ts < ?`, cutoff.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return r.RowsAffected()
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,54 @@ import (
 	"gatekeeper/internal/proto"
 	"gatekeeper/internal/version"
 )
+
+// ---- 输入校验常量与函数 ----
+// 这些校验防止特殊字符破坏 session 解析（session 值以 | 分隔），
+// 同时防止 LIKE 通配符注入、超长输入存储滥用等问题。
+
+const (
+	maxUsernameLen  = 64  // 用户名最大长度
+	maxAgentIDLen   = 128 // agent_id 最大长度
+	maxShellPatLen  = 500 // shell 规则 pattern 最大长度
+	maxTokenNoteLen = 256 // token 备注/绑定 agent_id 最大长度
+	maxDispatchUser = 64  // dispatch user 字段最大长度
+)
+
+// reUsername 用户名白名单: 字母/数字/下划线/连字符，1~maxUsernameLen 位。
+// 不允许 | % _ 等特殊字符，防止破坏 session 解析 (session 格式 "username|role|expires")
+// 和 LIKE 通配符注入。
+var reUsername = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+
+// validUsername 校验用户名是否合法，不合法返回错误描述。
+func validUsername(name string) (bool, string) {
+	if name == "" {
+		return false, "username required"
+	}
+	if len(name) > maxUsernameLen {
+		return false, "username too long (max 64 characters)"
+	}
+	if !reUsername.MatchString(name) {
+		return false, "username contains invalid characters (only a-z A-Z 0-9 _ - allowed)"
+	}
+	return true, ""
+}
+
+// reAgentID agent_id 白名单: 字母/数字/点/下划线/连字符，1~maxAgentIDLen 位。
+var reAgentID = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,128}$`)
+
+// validAgentID 校验 agent_id 格式。
+func validAgentID(id string) (bool, string) {
+	if id == "" {
+		return false, "agent_id required"
+	}
+	if len(id) > maxAgentIDLen {
+		return false, "agent_id too long (max 128 characters)"
+	}
+	if !reAgentID.MatchString(id) {
+		return false, "agent_id contains invalid characters (only a-z A-Z 0-9 . _ - allowed)"
+	}
+	return true, ""
+}
 
 // ---- 登录限速 ----
 // 两层防护：
@@ -429,7 +478,7 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		min := s.retentionMinDays
 		if body.Days < min {
-			http.Error(w, fmt.Sprintf("retention days must >= %d (yaml floor)", min), http.StatusBadRequest)
+			jsonError(w, fmt.Sprintf("retention days must >= %d (yaml floor)", min), http.StatusBadRequest)
 			return
 		}
 		_ = s.Store.SettingSet("audit_retention_days", strconv.Itoa(body.Days))
@@ -475,6 +524,23 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleShellRuleDelete(w, r)
+
+	// ---- 账户巡检 API ----
+	case path == "/api/account_scans" && r.Method == http.MethodGet:
+		agentID := r.URL.Query().Get("agent_id")
+		statusFilter := r.URL.Query().Get("status")
+		scans, err := s.Store.ListAccountScans(agentID, statusFilter)
+		respond(w, scans, err)
+	case path == "/api/account_scans/summary" && r.Method == http.MethodGet:
+		sum, err := s.Store.GetAccountScanSummary()
+		respond(w, sum, err)
+	case path == "/api/account_scans/trigger" && r.Method == http.MethodPost:
+		if ac := actorOf(r); !ac.HasRole("admin", "operator") {
+			forbidden(w, r)
+			return
+		}
+		s.handleScanTrigger(w, r)
+
 	default:
 		http.NotFound(w, r)
 	}
@@ -498,9 +564,9 @@ func pagedResult(items any, total, page, pageSize int) map[string]any {
 	}
 }
 
-// forbidden 返回 403, 用于 RBAC 校验失败。
+// forbidden 返回 403 JSON 错误, 用于 RBAC 校验失败。
 func forbidden(w http.ResponseWriter, _ *http.Request) {
-	http.Error(w, "forbidden: insufficient role", http.StatusForbidden)
+	jsonError(w, "forbidden: insufficient role", http.StatusForbidden)
 }
 
 // ---- 用户管理 handlers ----
@@ -528,27 +594,31 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if body.Username == "" || body.Password == "" {
-		http.Error(w, "username and password required", http.StatusBadRequest)
+		jsonError(w, "username and password required", http.StatusBadRequest)
+		return
+	}
+	if ok, msg := validUsername(body.Username); !ok {
+		jsonError(w, msg, http.StatusBadRequest)
 		return
 	}
 	if len(body.Password) < 8 {
-		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+		jsonError(w, "password must be at least 8 characters", http.StatusBadRequest)
 		return
 	}
 	if body.Role == "" {
 		body.Role = "operator"
 	}
 	if body.Role != "admin" && body.Role != "operator" && body.Role != "auditor" {
-		http.Error(w, "role must be admin/operator/auditor", http.StatusBadRequest)
+		jsonError(w, "role must be admin/operator/auditor", http.StatusBadRequest)
 		return
 	}
 	h, err := HashPassword(body.Password)
 	if err != nil {
-		http.Error(w, "hash error", http.StatusInternalServerError)
+		jsonError(w, "hash error", http.StatusInternalServerError)
 		return
 	}
 	if err := s.Store.CreateUser(body.Username, h, body.Role); err != nil {
-		http.Error(w, "create failed (username may already exist)", http.StatusConflict)
+		jsonError(w, "create failed (username may already exist)", http.StatusConflict)
 		return
 	}
 	s.Store.Audit(ac.Actor, "user_create", body.Username, "role="+body.Role, ac.IP)
@@ -568,16 +638,16 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Username == "" || body.Password == "" {
-		http.Error(w, "username and password required", http.StatusBadRequest)
+		jsonError(w, "username and password required", http.StatusBadRequest)
 		return
 	}
 	if len(body.Password) < 8 {
-		http.Error(w, "password must be at least 8 characters", http.StatusBadRequest)
+		jsonError(w, "password must be at least 8 characters", http.StatusBadRequest)
 		return
 	}
 	h, err := HashPassword(body.Password)
 	if err != nil {
-		http.Error(w, "hash error", http.StatusInternalServerError)
+		jsonError(w, "hash error", http.StatusInternalServerError)
 		return
 	}
 	if err := s.Store.SetUserPassword(body.Username, h); err != nil {
@@ -602,13 +672,13 @@ func (s *Server) handleUserDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if body.Username == "" {
-		http.Error(w, "username required", http.StatusBadRequest)
+		jsonError(w, "username required", http.StatusBadRequest)
 		return
 	}
 	// 防止禁用最后一个 admin
 	if body.Disabled && body.Username == ac.Actor {
 		if n, _ := s.Store.CountAdmins(); n <= 1 {
-			http.Error(w, "refuse: cannot disable the last admin (yourself)", http.StatusConflict)
+			jsonError(w, "refuse: cannot disable the last admin (yourself)", http.StatusConflict)
 			return
 		}
 	}
@@ -635,17 +705,17 @@ func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if body.Username == "" {
-		http.Error(w, "username required", http.StatusBadRequest)
+		jsonError(w, "username required", http.StatusBadRequest)
 		return
 	}
 	if body.Username == ac.Actor {
-		http.Error(w, "refuse: cannot delete yourself", http.StatusConflict)
+		jsonError(w, "refuse: cannot delete yourself", http.StatusConflict)
 		return
 	}
 	u, _, _ := s.Store.GetUser(body.Username)
 	if u != nil && u.Role == "admin" {
 		if n, _ := s.Store.CountAdmins(); n <= 1 {
-			http.Error(w, "refuse: cannot delete the last admin", http.StatusConflict)
+			jsonError(w, "refuse: cannot delete the last admin", http.StatusConflict)
 			return
 		}
 	}
@@ -668,7 +738,7 @@ func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.alert == nil {
-		http.Error(w, "告警未启用 (配置 alerts.enabled=false 或 webhook_url 为空)", http.StatusServiceUnavailable)
+		jsonError(w, "告警未启用 (配置 alerts.enabled=false 或 webhook_url 为空)", http.StatusServiceUnavailable)
 		return
 	}
 	var body struct {
@@ -679,13 +749,13 @@ func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
 		// 取第一个 agent
 		ags, _, _ := s.Store.ListAgentsPaged(1, 1, "")
 		if len(ags) == 0 {
-			http.Error(w, "没有任何已注册 agent, 无法测试", http.StatusBadRequest)
+			jsonError(w, "没有任何已注册 agent, 无法测试", http.StatusBadRequest)
 			return
 		}
 		body.AgentID = ags[0].AgentID
 	}
 	if err := s.alert.ForceAlert(body.AgentID); err != nil {
-		http.Error(w, "告警发送失败: "+err.Error(), http.StatusBadGateway)
+		jsonError(w, "告警发送失败: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	s.Store.Audit(ac.Actor, "alert_test", body.AgentID, "手动触发 webhook 测试", ac.IP)
@@ -778,6 +848,14 @@ func (s *Server) handleShellRuleAdd(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "模式不能为空")
 		return
 	}
+	if len(body.Pattern) > maxShellPatLen {
+		badRequest(w, fmt.Sprintf("模式过长 (最多 %d 字符)", maxShellPatLen))
+		return
+	}
+	if len(body.Note) > maxTokenNoteLen {
+		badRequest(w, fmt.Sprintf("备注过长 (最多 %d 字符)", maxTokenNoteLen))
+		return
+	}
 	id, err := s.Store.AddShellRule(body.Type, body.Pattern, body.Note)
 	if err != nil {
 		respond(w, nil, fmt.Errorf("add rule: %w", err))
@@ -816,6 +894,14 @@ func (s *Server) handleShellRuleUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if len(pattern) > maxShellPatLen {
+		badRequest(w, fmt.Sprintf("模式过长 (最多 %d 字符)", maxShellPatLen))
+		return
+	}
+	if len(note) > maxTokenNoteLen {
+		badRequest(w, fmt.Sprintf("备注过长 (最多 %d 字符)", maxTokenNoteLen))
+		return
+	}
 	if err := s.Store.UpdateShellRule(body.ID, pattern, note, body.Enabled); err != nil {
 		respond(w, nil, fmt.Errorf("update rule: %w", err))
 		return
@@ -847,9 +933,22 @@ func (s *Server) handleShellRuleDelete(w http.ResponseWriter, r *http.Request) {
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
+// handleScanTrigger 手动触发对指定 agent 的账户巡检扫描。
+func (s *Server) handleScanTrigger(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AgentID string `json:"agent_id"` // 空=扫描所有在线 agent
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	ac := actorOf(r)
+	accepted := s.TriggerAccountScan(body.AgentID)
+	s.Store.Audit(ac.Actor, "scan_trigger", body.AgentID, fmt.Sprintf("accepted=%d", accepted), ac.IP)
+	respond(w, map[string]int{"accepted": accepted}, nil)
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	if !loginAllowed(ip) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "too many failed attempts, try later"})
 		return
@@ -863,14 +962,29 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if body.Username == "" {
 		body.Username = "admin"
 	}
+	// 用户名格式校验: 防止含 | % 等特殊字符的用户名破坏 session 解析或 LIKE 匹配。
+	// 校验失败时返回与用户不存在相同的响应，避免用户名枚举。
+	if ok, _ := validUsername(body.Username); !ok {
+		cool := loginFail(ip)
+		s.Store.Audit(body.Username, "login_failed", "", "reason=invalid_username_format ip="+ip, ip)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		if cool > 0 {
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials", "cooldown": intToStr(int64(cool))})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials"})
+		}
+		return
+	}
 	u, hash, err := s.Store.GetUser(body.Username)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if u == nil || hash == "" || u.Disabled {
 		cool := loginFail(ip)
 		s.Store.Audit(body.Username, "login_failed", "", "reason=user_not_found_or_disabled ip="+ip, ip)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		if cool > 0 {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials", "cooldown": intToStr(int64(cool))})
@@ -882,6 +996,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !CheckPassword(hash, body.Password) {
 		cool := loginFail(ip)
 		s.Store.Audit(body.Username, "login_failed", "", "ip="+ip, ip)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		if cool > 0 {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials", "cooldown": intToStr(int64(cool))})
@@ -919,20 +1034,40 @@ func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		AgentID string   `json:"agent_id"`
 		Tags    []string `json:"tags"`
-		Notes   string   `json:"notes"`
+		Notes   *string  `json:"notes"` // 指针: nil=不改, ""=清空
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	if body.AgentID == "" {
+		jsonError(w, "agent_id required", http.StatusBadRequest)
+		return
+	}
+	if len(body.AgentID) > maxAgentIDLen {
+		jsonError(w, fmt.Sprintf("agent_id too long (max %d characters)", maxAgentIDLen), http.StatusBadRequest)
+		return
+	}
+	if len(body.Tags) > 20 {
+		jsonError(w, "too many tags (max 20)", http.StatusBadRequest)
+		return
+	}
+	notesVal := ""
+	if body.Notes != nil {
+		notesVal = *body.Notes
+		if len(notesVal) > maxTokenNoteLen {
+			jsonError(w, fmt.Sprintf("notes too long (max %d characters)", maxTokenNoteLen), http.StatusBadRequest)
+			return
+		}
 	}
 	ac := actorOf(r)
 	if body.Tags != nil {
 		_ = s.Store.SetAgentTags(body.AgentID, body.Tags)
 	}
-	if body.Notes != "" {
-		_ = s.Store.SetAgentNotes(body.AgentID, body.Notes)
+	if body.Notes != nil {
+		_ = s.Store.SetAgentNotes(body.AgentID, *body.Notes)
 	}
-	s.Store.Audit(ac.Actor, "agent_update", body.AgentID, fmt.Sprintf("tags=%v notes=%s", body.Tags, body.Notes), ac.IP)
+	s.Store.Audit(ac.Actor, "agent_update", body.AgentID, fmt.Sprintf("tags=%v notes=%s", body.Tags, notesVal), ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
@@ -941,24 +1076,36 @@ func (s *Server) handleAgentUpdateID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/agent/")
 	var body struct {
 		Tags  []string `json:"tags"`
-		Notes string   `json:"notes"`
+		Notes *string  `json:"notes"` // 指针: nil=不改, ""=清空
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if len(body.Tags) > 20 {
+		jsonError(w, "too many tags (max 20)", http.StatusBadRequest)
+		return
+	}
+	notesVal := ""
+	if body.Notes != nil {
+		notesVal = *body.Notes
+		if len(notesVal) > maxTokenNoteLen {
+			jsonError(w, fmt.Sprintf("notes too long (max %d characters)", maxTokenNoteLen), http.StatusBadRequest)
+			return
+		}
+	}
 	ac := actorOf(r)
 	if body.Tags != nil {
 		_ = s.Store.SetAgentTags(id, body.Tags)
 	}
-	if body.Notes != "" {
-		_ = s.Store.SetAgentNotes(id, body.Notes)
+	if body.Notes != nil {
+		_ = s.Store.SetAgentNotes(id, *body.Notes)
 	}
-	s.Store.Audit(ac.Actor, "agent_update", id, fmt.Sprintf("tags=%v notes=%s", body.Tags, body.Notes), ac.IP)
+	s.Store.Audit(ac.Actor, "agent_update", id, fmt.Sprintf("tags=%v notes=%s", body.Tags, notesVal), ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
 }
 
 func (s *Server) handleAgentDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		http.Error(w, "id required", http.StatusBadRequest)
+		jsonError(w, "id required", http.StatusBadRequest)
 		return
 	}
 	// 安全: 先踢活会话, 再尝试硬删除(仅允许离线 agent 被删, 防误删活主机)
@@ -966,11 +1113,11 @@ func (s *Server) handleAgentDelete(w http.ResponseWriter, r *http.Request) {
 	del, err := s.Store.DeleteAgent(id)
 	if err != nil {
 		// 多半是 agent 仍标记 online
-		http.Error(w, err.Error(), http.StatusConflict)
+		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
 	if !del {
-		http.Error(w, "agent not found", http.StatusNotFound)
+		jsonError(w, "agent not found", http.StatusNotFound)
 		return
 	}
 	ac := actorOf(r)
@@ -984,6 +1131,14 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 		BindAgentID string `json:"bind_agent_id"` // 可选: 创建即绑定到指定 agent_id
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if len(body.Note) > maxTokenNoteLen {
+		jsonError(w, fmt.Sprintf("note too long (max %d characters)", maxTokenNoteLen), http.StatusBadRequest)
+		return
+	}
+	if len(body.BindAgentID) > maxAgentIDLen {
+		jsonError(w, fmt.Sprintf("bind_agent_id too long (max %d characters)", maxAgentIDLen), http.StatusBadRequest)
+		return
+	}
 	tok := genToken()
 	if err := s.Store.EnsureToken(tok, body.Note, body.BindAgentID); err != nil {
 		respond(w, nil, err)
@@ -1002,7 +1157,11 @@ func (s *Server) handleTokenBind(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if body.Token == "" || body.AgentID == "" {
-		http.Error(w, "token and agent_id required", http.StatusBadRequest)
+		jsonError(w, "token and agent_id required", http.StatusBadRequest)
+		return
+	}
+	if len(body.AgentID) > maxAgentIDLen {
+		jsonError(w, fmt.Sprintf("agent_id too long (max %d characters)", maxAgentIDLen), http.StatusBadRequest)
 		return
 	}
 	if err := s.Store.BindToken(body.Token, body.AgentID); err != nil {
@@ -1044,12 +1203,12 @@ func (s *Server) handleTokenDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if body.Token == "" {
-		http.Error(w, "token required", http.StatusBadRequest)
+		jsonError(w, "token required", http.StatusBadRequest)
 		return
 	}
 	if err := s.Store.DeleteToken(body.Token); err != nil {
 		// 多半是 token 未撤销
-		http.Error(w, err.Error(), http.StatusConflict)
+		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
 	ac := actorOf(r)
@@ -1074,18 +1233,26 @@ type batchReq struct {
 func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	var req dispatchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if req.AgentID == "" || req.Action == "" {
-		http.Error(w, "agent_id and action required", http.StatusBadRequest)
+		jsonError(w, "agent_id and action required", http.StatusBadRequest)
+		return
+	}
+	if len(req.AgentID) > maxAgentIDLen {
+		jsonError(w, fmt.Sprintf("agent_id too long (max %d characters)", maxAgentIDLen), http.StatusBadRequest)
 		return
 	}
 	if req.User == "" {
 		req.User = "root"
 	}
+	if len(req.User) > maxDispatchUser {
+		jsonError(w, fmt.Sprintf("user too long (max %d characters)", maxDispatchUser), http.StatusBadRequest)
+		return
+	}
 	if !validAction(req.Action) {
-		http.Error(w, "unknown action", http.StatusBadRequest)
+		jsonError(w, "unknown action", http.StatusBadRequest)
 		return
 	}
 	// shell action 需要额外校验: 是否启用 + 黑白名单策略
@@ -1142,18 +1309,26 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDispatchBatch(w http.ResponseWriter, r *http.Request) {
 	var req batchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if len(req.AgentIDs) == 0 || req.Action == "" {
-		http.Error(w, "agent_ids and action required", http.StatusBadRequest)
+		jsonError(w, "agent_ids and action required", http.StatusBadRequest)
+		return
+	}
+	if len(req.AgentIDs) > 100 {
+		jsonError(w, "too many agent_ids (max 100)", http.StatusBadRequest)
 		return
 	}
 	if req.User == "" {
 		req.User = "root"
 	}
+	if len(req.User) > maxDispatchUser {
+		jsonError(w, fmt.Sprintf("user too long (max %d characters)", maxDispatchUser), http.StatusBadRequest)
+		return
+	}
 	if !validAction(req.Action) {
-		http.Error(w, "unknown action", http.StatusBadRequest)
+		jsonError(w, "unknown action", http.StatusBadRequest)
 		return
 	}
 	// shell action 需要额外校验: 是否启用 + 黑白名单策略 (与单发保持一致)
@@ -1244,8 +1419,14 @@ func respond(w http.ResponseWriter, v any, err error) {
 
 // badRequest 返回 400 JSON 错误, 用于客户端输入校验失败。
 func badRequest(w http.ResponseWriter, msg string) {
+	jsonError(w, msg, http.StatusBadRequest)
+}
+
+// jsonError 返回 JSON 格式的错误响应，确保前端 r.json() 能正确解析。
+// 所有 API handler 应使用此函数替代 http.Error()，以保持前端错误提示一致性。
+func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
+	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 

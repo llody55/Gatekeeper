@@ -23,14 +23,16 @@ Gatekeeper 让你在拿到服务器装机时就装一个常驻 **agent**；agent
 - **单二进制 + SQLite**：server / agent 各一静态二进制，零外部依赖，`modernc.org/sqlite` 纯 Go 驱动，交叉编译友好。
 - **反向长连突破防火墙**：agent 主动 WebSocket 连接 server，不要求 server 到 agent 的入站可达；只复用几乎都开放的出站 443/8443。
 - **预共享 Token 鉴权**：每个 agent 一个 token，server 在数据库登记；登录 Web 控制台用独立 admin 口令，会话 12h。
-- **5 个原子救援动作 + 一键组合救援 + 通用 shell**：`chage_status` / `expire_extend` / `unlock` / `clear_fail` / `reset_password` / `combo` / `shell`（自定义命令，受黑白名单管控）。
+- **5 个原子救援动作 + 一键组合救援 + 通用 shell + 账户巡检**：`chage_status` / `expire_extend` / `unlock` / `clear_fail` / `reset_password` / `combo` / `shell`（自定义命令，受黑白名单管控）/ `scan_accounts`（定时扫描账户过期状态）。
 - **批量与分组**：主机标签、备注、按标签过滤、批量下发、批量打标签。
 - **实时推送**：浏览器 WebSocket 订阅上/下线、回执事件，回执到表里就刷新。
 - **完整审计**：注册/登录/下发/批量下发/token 创建/撤销/标签变更/agent 删除全部入审计表，留 actor、目标、来源 IP。
 - **指令超时回收**：超时未回执的指令后台扫描器自动标记 `timeout`，避免 UI 假挂起。
 - **配置外提**：YAML 配置文件 + 环境变量 + 命令行 flag 三级覆盖，无任何硬编码地址/口令/超时。
 - **通用 shell 下发**：自定义命令通过 `bash -c` 远程执行，glob 黑白名单策略管控（黑名单优先），默认关闭需管理员显式启用。
+- **账户巡检**：定时扫描主机上所有可登录账户的过期/密码状态，自动判定 6 种状态并上报平台，UI 巡检面板实时展示，提前发现将过期账户。
 - **Agent 断线秒级重连**：指数退避重连 + 读超时存活检测（heartbeat × 3），网络静默中断后 90s 内自动恢复，不会卡死。
+- **优雅关闭**：server 收到 SIGTERM/SIGINT 后安全关闭 HTTP 连接、WebSocket 会话和数据库，避免数据丢失。
 - **TLS 可选**：内网 `/tls` 关闭明文 ws/http；公网/混合云用 `-tls-cert/-tls-key` 升级到 wss/https。
 
 ## 架构一图流
@@ -46,11 +48,13 @@ Gatekeeper 让你在拿到服务器装机时就装一个常驻 **agent**；agent
 │  Gatekeeper Server  (单二进制 + SQLite)                         │
 │  ├─ /api/login, /api/agents, /api/dispatch[_batch]              │
 │  ├─ /api/shell/policy, /api/shell/rules (shell 策略管理)         │
+│  ├─ /api/account_scans, /api/account_scans/summary (账户巡检)    │
 │  ├─ /agent   WebSocket 接入 (鉴权 X-Agent-Token)                │
 │  ├─ /ui/events  浏览器订阅事件流                                │
 │  ├─ 会话池 agent_id -> Session                                  │
-│  ├─ Store: agents / tokens / commands / audit_log / settings / shell_rules │
-│  └─ 超时扫描器 (15s 周期)                                       │
+│  ├─ Store: agents / tokens / commands / audit_log / settings / shell_rules / account_scans │
+│  ├─ 超时扫描器 (15s 周期)                                       │
+│  └─ 账户巡检调度器 (默认 6h)                                    │
 └────────────────────────────────────────────────────────────────┘
             ▲ agent 主动反向出站                   ▲ agent
             │ ws/wss://server:8443/agent           │
@@ -61,6 +65,7 @@ Gatekeeper 让你在拿到服务器装机时就装一个常驻 **agent**；agent
    └────────────────┘  └────────────────┘  └────────────────┘
      agent 在每台主机执行 chage / passwd / usermod / faillock / pam_tally2
      或 bash -c 执行自定义命令 (受黑白名单管控)
+     或 scan_accounts 定时扫描账户过期状态并上报
 ```
 
 ## 快速开始
@@ -77,7 +82,7 @@ sudo mkdir -p /var/lib/gatekeeper
 # 日志里会看到: [security] 首次启动，已自动生成管理员口令(请妥善保存)
 # 浏览器打开 http://<server-ip>:8443/, 输入上面那个口令登录
 
-# 3. 在 Web 控制台 Token 页生成一个 agent token (或用启动时登记的 bootstrap token)
+# 3. 在 Web 控制台 Token 页生成一个 agent token (或配置 agent.bootstrap_token)
 
 # 4. 在被保护主机装 agent (root 身份)
 cp examples/agent.yaml /etc/gatekeeper/agent.yaml
@@ -129,9 +134,9 @@ cp examples/agent.yaml /etc/gatekeeper/agent.yaml
 
 ## 路线图
 
-已实现：登录会话、agent 注册、5 动作救援 + 通用 shell、批量/标签、审计、实时推送、超时回收、TLS、配置外提、黑白名单策略、断线秒级重连。
+已实现：登录会话、agent 注册、5 动作救援 + 通用 shell + 账户巡检、批量/标签、审计、实时推送、超时回收、TLS、配置外提、黑白名单策略、断线秒级重连、优雅关闭。
 近期：
-- [ ] 基于标签/批次的定时巡检(提前发现将过期账户并告警)
+- [ ] 巡检告警通知（过期账户 webhook/邮件推送）
 - [ ] 指令审批工作流(双人复核改密)
 - [ ] 外接 MySQL/PostgreSQL 后端(替代 SQLite)
 - [ ] 指令输出可下载、命令重放

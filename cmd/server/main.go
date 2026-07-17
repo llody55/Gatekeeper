@@ -2,13 +2,17 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"gatekeeper/internal/config"
@@ -72,15 +76,13 @@ func main() {
 		log.Printf("[security] 使用 users 表中已有 admin 账号; 若需重置请登录后到用户管理页或修改 server.yaml")
 	}
 
-	// 处理 agent token
+	// 处理 agent token: 仅登记配置文件中显式指定的 bootstrap token, 不再自动生成。
+	// 首次部署请通过 UI「Token 管理」或 API 手动创建 token。
 	if cfg.Agent.BootstrapToken != "" {
 		_ = store.EnsureToken(cfg.Agent.BootstrapToken, "bootstrap", "")
 		log.Printf("[bootstrap] 已登记 agent token (来自配置): %s...", server.TokenPrefix(cfg.Agent.BootstrapToken))
 	} else if n, _ := store.TokenCount(); n == 0 {
-		t := randomHex(10)
-		_ = store.EnsureToken(t, "auto-bootstrap", "")
-		store.Audit("system", "token_bootstrap", server.TokenPrefix(t), "auto generated on first run", "127.0.0.1")
-		log.Printf("[bootstrap] 首次启动无任何 agent token，已自动生成: %s", t)
+		log.Printf("[bootstrap] 当前无任何 agent token，请通过 UI「Token 管理」或 API 手动创建")
 	}
 
 	// agent 健康告警检查器: 可配置 webhook, 超时未心跳触发
@@ -89,7 +91,7 @@ func main() {
 	go alertChecker.Run(alertCh)
 
 	srv := server.New(store, cfg.TrustedProxies, cfg.Agent.BindBootstrapToken,
-		int(cfg.Defaults.HistoryRetention/(24*time.Hour)), cfg.UI.SessionTTL)
+		int(cfg.Defaults.HistoryRetention/(24*time.Hour)), cfg.UI.SessionTTL, cfg.Agent.HeartbeatTimeout)
 	srv.SetAlerter(alertChecker)
 
 	// 初始化 shell 策略: 种子默认黑白名单 + 加载配置到内存
@@ -129,8 +131,8 @@ func main() {
 	} else {
 		_ = store.SettingSet("shell_max_output", strconv.Itoa(shellMaxOutput))
 	}
-	// 匹配模式: legacy(默认) / permissive / strict_chars / strict_glob
-	shellMatchMode := "legacy"
+	// 匹配模式: strict_glob(默认) / legacy / permissive / strict_chars
+	shellMatchMode := "strict_glob"
 	if v, _ := store.SettingGet("shell_match_mode"); v != "" {
 		shellMatchMode = v
 	} else {
@@ -157,6 +159,8 @@ func main() {
 	go runHeartbeatSweeper(store, cfg.Agent.HeartbeatTimeout)
 	// 数据留存清理器：每日跑一次, 按 DB settings 与 YAML 下限取较大值(更严格)
 	go runRetentionWorker(store, cfg.Defaults.HistoryRetention)
+	// 账户巡检调度器 (默认每 6 小时扫描一次)
+	go srv.StartAccountScanScheduler(resolveScanInterval(store), make(chan struct{}))
 
 	hs := &http.Server{
 		Addr:              cfg.Listen,
@@ -167,12 +171,40 @@ func main() {
 	log.Printf("[gatekeeper-server] 监听 %s (登录口令已在启动日志中显示)", cfg.Listen)
 	fmt.Println("→ 浏览器打开 http://<server-ip>:<port>/ 输入管理员口令登录。Agent 接入命令参考 README。")
 
-	if cfg.TLS.Cert != "" && cfg.TLS.Key != "" {
-		log.Fatal(hs.ListenAndServeTLS(cfg.TLS.Cert, cfg.TLS.Key))
-	} else {
-		log.Printf("[warn] 未启用 TLS，使用明文 ws/http —— 仅建议内网/测试环境使用")
-		log.Fatal(hs.ListenAndServe())
+	// 优雅关闭: 监听 SIGTERM/SIGINT, 安全关闭 HTTP server 和 DB。
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		if cfg.TLS.Cert != "" && cfg.TLS.Key != "" {
+			if err := hs.ListenAndServeTLS(cfg.TLS.Cert, cfg.TLS.Key); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("TLS 服务启动失败: %v", err)
+			}
+		} else {
+			log.Printf("[warn] 未启用 TLS，使用明文 ws/http —— 仅建议内网/测试环境使用")
+			if err := hs.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("服务启动失败: %v", err)
+			}
+		}
+	}()
+
+	sig := <-sigCh
+	log.Printf("[gatekeeper-server] 收到信号 %v, 开始优雅关闭...", sig)
+
+	// 通知后台 goroutine 停止
+	close(alertCh)
+
+	// 给 HTTP 服务 15 秒完成正在处理的请求和 WebSocket 关闭
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := hs.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[gatekeeper-server] HTTP 关闭超时: %v", err)
 	}
+
+	if err := store.Close(); err != nil {
+		log.Printf("[gatekeeper-server] DB 关闭失败: %v", err)
+	}
+	log.Printf("[gatekeeper-server] 已安全退出")
 }
 
 // runTimeoutSweeper 定期把超过 timeout 仍 pending 的指令标记为 timeout。
@@ -251,4 +283,16 @@ func resolveRetentionDays(store *server.Store, minDays int) int {
 		return minDays
 	}
 	return n
+}
+
+// resolveScanInterval 解析 DB settings 中的 account_scan_interval_hours,
+// 缺省 6 小时, 最少 1 小时。
+func resolveScanInterval(store *server.Store) time.Duration {
+	v, _ := store.SettingGet("account_scan_interval_hours")
+	if v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return time.Duration(n) * time.Hour
+		}
+	}
+	return 6 * time.Hour
 }

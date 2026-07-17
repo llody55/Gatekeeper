@@ -4,11 +4,13 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -94,18 +96,32 @@ func Execute(c *proto.Cmd) *proto.Result {
 		res.Output, res.OK = all.String(), true
 
 	case proto.ActionUnlock:
+		// 解锁账户有两道独立的锁机制:
+		//   usermod -U  → 解除账户锁 (shadow 第2列的 !! 前缀)
+		//   passwd -u   → 解除密码锁 (shadow 第2列的 ! 前缀)
+		// 等保合规场景可能同时有两道锁, 必须都尝试, 不能因为一道失败就放弃另一道。
+		// passwd -u 在密码未锁时会返回 "Warning: password already unlocked" (exit 0),
+		// usermod -U 在账户未锁时返回成功, 两者互不冲突。
 		var all strings.Builder
-		// usermod -U 解锁账户
+		ok := true
 		out, err := runCmd("usermod", "-U", user)
 		fmt.Fprintf(&all, "usermod -U %s => %v  %s\n", user, err, strings.TrimSpace(out))
 		if err != nil {
-			res.Output, res.Err, res.OK = all.String(), errStr(err), false
-			return res
+			ok = false
 		}
-		// passwd -u 解锁密码（可能本来就未锁，忽略报错）
-		out, err = runCmd("passwd", "-u", user)
-		fmt.Fprintf(&all, "passwd -u %s => %v  %s\n", user, err, strings.TrimSpace(out))
-		res.Output, res.OK = all.String(), true
+		out2, err2 := runCmd("passwd", "-u", user)
+		fmt.Fprintf(&all, "passwd -u %s => %v  %s\n", user, err2, strings.TrimSpace(out2))
+		if err2 != nil {
+			// passwd -u 失败可能是"密码本来就未锁" (某些发行版返回非0),
+			// 只有 usermod -U 也失败时才算整体失败。
+			if err != nil {
+				ok = false
+			}
+		}
+		res.Output, res.OK = all.String(), ok
+		if !ok {
+			res.Err = "usermod -U and passwd -u both failed"
+		}
 
 	case proto.ActionClearFail:
 		var all strings.Builder
@@ -164,6 +180,12 @@ func Execute(c *proto.Cmd) *proto.Result {
 		res.Output, res.Err, res.OK = execShell(c)
 		if res.Err != "" && !res.OK {
 			log.Printf("[agent] shell 执行失败: %s err=%s", c.ID, res.Err)
+		}
+
+	case proto.ActionScanAccounts:
+		res.Output, res.OK = scanAccounts(c)
+		if !res.OK {
+			res.Err = "scan_accounts failed"
 		}
 
 	default:
@@ -326,4 +348,206 @@ func fmtAtoi(s string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// AccountInfo 描述单个账户的过期/密码状态, 用于 scan_accounts 上报。
+type AccountInfo struct {
+	Username       string `json:"username"`
+	UID            int    `json:"uid"`
+	Status         string `json:"status"`          // active / expired / locked / password_expired / unknown
+	LastChange     string `json:"last_change"`     // 密码最后修改日期 (YYYY-MM-DD)
+	ExpireDate     string `json:"expire_date"`     // 账户过期日期 (never / YYYY-MM-DD)
+	PasswordExpire string `json:"password_expire"` // 密码过期日期
+	InactiveDays   int    `json:"inactive_days"`   // 不活跃天数限制
+	MinDays        int    `json:"min_days"`        // 最小密码使用天数
+	MaxDays        int    `json:"max_days"`        // 最大密码使用天数
+	WarnDays       int    `json:"warn_days"`       // 过期前警告天数
+}
+
+// scanAccounts 扫描主机上的非系统用户, 解析 chage -l 输出, 返回 JSON 数组。
+func scanAccounts(c *proto.Cmd) (string, bool) {
+	minUID := 0
+	if v := c.Params["min_uid"]; v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			minUID = n
+		}
+	}
+	var accounts []AccountInfo
+	users := listUsers(minUID)
+	for _, u := range users {
+		info := parseChage(u.username)
+		info.UID = u.uid
+		accounts = append(accounts, info)
+	}
+	b, err := json.Marshal(accounts)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+type userEntry struct {
+	username string
+	uid      int
+}
+
+// listUsers 读取 /etc/passwd 返回 UID >= minUID 且 shell 为可登录的用户列表。
+func listUsers(minUID int) []userEntry {
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		log.Printf("[agent] 读取 /etc/passwd 失败: %v", err)
+		return nil
+	}
+	var out []userEntry
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Split(line, ":")
+		if len(parts) < 7 {
+			continue
+		}
+		uid, err := strconv.Atoi(parts[2])
+		if err != nil || uid < minUID {
+			continue
+		}
+		// 跳过常见的 nobody (65534)
+		if uid == 65534 {
+			continue
+		}
+		// 过滤不可登录的 shell: /usr/sbin/nologin, /sbin/nologin, /bin/false, /bin/sync 等
+		shell := strings.TrimSpace(parts[6])
+		if isNoLoginShell(shell) {
+			continue
+		}
+		out = append(out, userEntry{username: parts[0], uid: uid})
+	}
+	return out
+}
+
+// isNoLoginShell 判断 shell 是否为不可登录类型。
+func isNoLoginShell(shell string) bool {
+	switch shell {
+	case "/usr/sbin/nologin", "/sbin/nologin", "/bin/nologin",
+		"/bin/false", "/usr/bin/false",
+		"/bin/sync", "/sbin/shutdown", "/sbin/halt":
+		return true
+	default:
+		// 也匹配路径以 nologin 结尾的变体 (如 /usr/sbin/nologin)
+		return strings.HasSuffix(shell, "/nologin")
+	}
+}
+
+// parseChage 对指定用户运行 chage -l, 解析输出为 AccountInfo。
+func parseChage(user string) AccountInfo {
+	info := AccountInfo{Username: user, Status: "active"}
+	out, err := runCmd("chage", "-l", user)
+	if err != nil {
+		info.Status = "unknown"
+		return info
+	}
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+
+		switch {
+		case strings.Contains(key, "Last password change"):
+			info.LastChange = parseChageDate(val)
+		case strings.Contains(key, "Password expires"):
+			info.PasswordExpire = parseChageDate(val)
+		case strings.Contains(key, "Password inactive"):
+			if v, err := strconv.Atoi(val); err == nil {
+				info.InactiveDays = v
+			}
+		case strings.Contains(key, "Account expires"):
+			info.ExpireDate = parseChageDate(val)
+		case strings.Contains(key, "Minimum number of days"):
+			if v, err := strconv.Atoi(val); err == nil {
+				info.MinDays = v
+			}
+		case strings.Contains(key, "Maximum number of days"):
+			if v, err := strconv.Atoi(val); err == nil {
+				info.MaxDays = v
+			}
+		case strings.Contains(key, "Number of days of warning"):
+			if v, err := strconv.Atoi(val); err == nil {
+				info.WarnDays = v
+			}
+		}
+	}
+	// 判断状态
+	info.Status = computeAccountStatus(info)
+	return info
+}
+
+// parseChageDate 解析 chage 输出的日期字段, 返回 "YYYY-MM-DD" 或 "never"。
+func parseChageDate(val string) string {
+	val = strings.TrimSpace(val)
+	if val == "" || strings.EqualFold(val, "never") || strings.EqualFold(val, "never expire") {
+		return "never"
+	}
+	// chage 输出格式类似 "May 07, 2026" 或 "Jan 01, 1970"
+	layouts := []string{
+		"Jan 02, 2006",
+		"January 02, 2006",
+		"2006-01-02",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, val); err == nil {
+			return t.Format("2006-01-02")
+		}
+	}
+	return val // 无法解析则返回原文
+}
+
+// computeAccountStatus 根据账户信息计算状态: active / password_expired / expired / locked。
+func computeAccountStatus(info AccountInfo) string {
+	now := time.Now().Truncate(24 * time.Hour)
+	// 账户已过期
+	if info.ExpireDate != "" && info.ExpireDate != "never" {
+		if t, err := time.Parse("2006-01-02", info.ExpireDate); err == nil && !t.After(now) {
+			return "expired"
+		}
+	}
+	// 密码已过期
+	if info.PasswordExpire != "" && info.PasswordExpire != "never" {
+		if t, err := time.Parse("2006-01-02", info.PasswordExpire); err == nil && !t.After(now) {
+			return "password_expired"
+		}
+	}
+	if info.LastChange == "" || info.LastChange == "never" {
+		// 从未改过密码, 可能被锁定
+		return "locked"
+	}
+	// 检查是否即将过期 (warn 范围内)
+	if info.PasswordExpire != "" && info.PasswordExpire != "never" {
+		if t, err := time.Parse("2006-01-02", info.PasswordExpire); err == nil {
+			warnDays := info.WarnDays
+			if warnDays <= 0 {
+				warnDays = 7
+			}
+			if t.Sub(now) <= time.Duration(warnDays)*24*time.Hour {
+				return "password_expiring"
+			}
+		}
+	}
+	// 账户即将过期
+	if info.ExpireDate != "" && info.ExpireDate != "never" {
+		if t, err := time.Parse("2006-01-02", info.ExpireDate); err == nil {
+			if t.Sub(now) <= 30*24*time.Hour {
+				return "expiring"
+			}
+		}
+	}
+	return "active"
 }

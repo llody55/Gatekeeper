@@ -10,6 +10,7 @@ const (
 	ActionResetPassword = "reset_password" // 重置密码
 	ActionCombo         = "combo"          // 组合执行（救援套餐）
 	ActionShell         = "shell"          // 通用 shell 命令执行
+	ActionScanAccounts  = "scan_accounts"  // 扫描主机账户过期信息并上报
 )
 
 // Kind 名常量。
