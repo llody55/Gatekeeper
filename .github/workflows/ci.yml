@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build (server + agent)
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X gatekeeper/internal/version.VERSION=$(cat VERSION)" -o /tmp/gatekeeper-server ./cmd/server
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X gatekeeper/internal/version.VERSION=$(cat VERSION)" -o /tmp/gatekeeper-agent ./cmd/agent
+
+      - name: go test
+        run: go test ./... -count=1

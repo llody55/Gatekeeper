@@ -8,30 +8,105 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
 
-// Store 封装 SQLite，存储 agent 注册信息、Token、指令历史与操作审计。
+// Store 封装数据库访问, 支持 sqlite / mysql / postgres。
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex
+	db      *sql.DB
+	dialect string // sqlite / mysql / postgres
+	mu      sync.RWMutex
 }
 
-func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+// Open 按 dbType 打开数据库并执行迁移。
+// dbType: sqlite(默认) / mysql / postgres。
+// sqlite 的 dsn 支持 ":memory:" 或文件路径; mysql/postgres 使用标准 DSN。
+func Open(dbType, dsn string) (*Store, error) {
+	if dbType == "" {
+		dbType = "sqlite"
+	}
+	var driver, realDSN string
+	switch dbType {
+	case "sqlite":
+		driver = "sqlite"
+		if dsn == ":memory:" {
+			realDSN = ":memory:"
+		} else {
+			realDSN = dsn + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		}
+	case "mysql":
+		driver = "mysql"
+		realDSN = dsn
+	case "postgres", "postgresql":
+		dbType = "postgres"
+		driver = "postgres"
+		realDSN = dsn
+	default:
+		return nil, fmt.Errorf("unsupported db type: %s", dbType)
+	}
+	db, err := sql.Open(driver, realDSN)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	if dbType == "sqlite" {
+		db.SetMaxOpenConns(4)
+	} else {
+		db.SetMaxOpenConns(20)
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(time.Hour)
+	}
+	s := &Store{db: db, dialect: dbType}
 	if err := s.migrate(); err != nil {
+		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
+// rebind 把 SQL 中的 ? 占位符转换为当前数据库方言的占位符。
+// sqlite/mysql 使用 ?, postgres 使用 $1, $2, ...
+func (s *Store) rebind(query string) string {
+	if s.dialect != "postgres" {
+		return query
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range query {
+		if r == '?' {
+			n++
+			fmt.Fprintf(&b, "$%d", n)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// exec 是 s.db.Exec 的封装, 自动做占位符转换。
+func (s *Store) exec(query string, args ...any) (sql.Result, error) {
+	return s.db.Exec(s.rebind(query), args...)
+}
+
+// query 是 s.db.Query 的封装, 自动做占位符转换。
+func (s *Store) query(query string, args ...any) (*sql.Rows, error) {
+	return s.db.Query(s.rebind(query), args...)
+}
+
+// queryRow 是 s.db.QueryRow 的封装, 自动做占位符转换。
+func (s *Store) queryRow(query string, args ...any) *sql.Row {
+	return s.db.QueryRow(s.rebind(query), args...)
+}
+
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
+	autoInc := "INTEGER PRIMARY KEY AUTOINCREMENT"
+	if s.dialect == "mysql" {
+		autoInc = "INTEGER PRIMARY KEY AUTO_INCREMENT"
+	} else if s.dialect == "postgres" {
+		autoInc = "SERIAL PRIMARY KEY"
+	}
+	_, err := s.exec(fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS agents (
   agent_id      TEXT PRIMARY KEY,
   token         TEXT NOT NULL,
@@ -45,12 +120,12 @@ CREATE TABLE IF NOT EXISTS agents (
   meta          TEXT
 );
 CREATE TABLE IF NOT EXISTS tokens (
-  token           TEXT PRIMARY KEY,  -- sha256(原始 token) hex, 不可逆
-  token_prefix    TEXT,                -- 原始 token 前 8 位, 仅用于 UI 辨识
+  token           TEXT PRIMARY KEY,
+  token_prefix    TEXT,
   note            TEXT,
   created_at      INTEGER NOT NULL,
   revoked         INTEGER NOT NULL DEFAULT 0,
-  bound_agent_id  TEXT                  -- 绑定的 agent_id; 非空则仅允许该 agent 用此 token 注册, 防止冒名
+  bound_agent_id  TEXT
 );
 CREATE TABLE IF NOT EXISTS commands (
   id            TEXT PRIMARY KEY,
@@ -67,7 +142,7 @@ CREATE TABLE IF NOT EXISTS commands (
 );
 CREATE INDEX IF NOT EXISTS idx_commands_agent ON commands(agent_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS audit_log (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  id            %s,
   ts            INTEGER NOT NULL,
   actor         TEXT NOT NULL,
   action        TEXT NOT NULL,
@@ -84,34 +159,36 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_at    INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS users (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  id            %s,
   username      TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
-  role          TEXT NOT NULL DEFAULT 'operator', -- admin / operator / auditor
+  role          TEXT NOT NULL DEFAULT 'operator',
   created_at    INTEGER NOT NULL,
   disabled      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS shell_rules (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  type          TEXT NOT NULL,           -- 'whitelist' 或 'blacklist'
-  pattern       TEXT NOT NULL,           -- glob 匹配模式, * 匹配任意字符
-  note          TEXT,                    -- 可选说明
+  id            %s,
+  type          TEXT NOT NULL,
+  pattern       TEXT NOT NULL,
+  note          TEXT,
   enabled       INTEGER NOT NULL DEFAULT 1,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_shell_rules_type ON shell_rules(type, enabled);
-`)
+`, autoInc, autoInc, autoInc))
 	if err != nil {
 		return err
 	}
 	// 老库兼容: 若 tokens 缺列则补上(忽略重复列报错)。
-	_, _ = s.db.Exec(`ALTER TABLE tokens ADD COLUMN token_prefix TEXT`)
-	_, _ = s.db.Exec(`ALTER TABLE tokens ADD COLUMN bound_agent_id TEXT`)
+	s.db.Exec(`ALTER TABLE tokens ADD COLUMN token_prefix TEXT`)
+	s.db.Exec(`ALTER TABLE tokens ADD COLUMN bound_agent_id TEXT`)
+	// v0.8: users 表加 email 字段(用户绑定邮箱, 用于告警通知)
+	s.db.Exec(`ALTER TABLE users ADD COLUMN email TEXT`)
 
 	// v0.7: 账户巡检记录表
-	s.db.Exec(`CREATE TABLE IF NOT EXISTS account_scans (
-		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	s.exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS account_scans (
+		id              %s,
 		agent_id        TEXT NOT NULL,
 		username        TEXT NOT NULL,
 		uid             INTEGER NOT NULL DEFAULT 0,
@@ -124,11 +201,29 @@ CREATE INDEX IF NOT EXISTS idx_shell_rules_type ON shell_rules(type, enabled);
 		max_days        INTEGER NOT NULL DEFAULT 0,
 		warn_days       INTEGER NOT NULL DEFAULT 0,
 		scan_ts         INTEGER NOT NULL DEFAULT 0
-	)`)
-	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_account_scans_agent ON account_scans(agent_id)`)
-	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_account_scans_status ON account_scans(status)`)
-	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_account_scans_unique ON account_scans(agent_id, username)`)
+	)`, autoInc))
+	s.createIndex("idx_account_scans_agent", "account_scans", "agent_id")
+	s.createIndex("idx_account_scans_status", "account_scans", "status")
+	s.createUniqueIndex("idx_account_scans_unique", "account_scans", "agent_id, username")
 	return nil
+}
+
+// createIndex 创建索引, MySQL 不支持 IF NOT EXISTS 时忽略已存在错误。
+func (s *Store) createIndex(name, table, cols string) {
+	if s.dialect == "mysql" {
+		_, _ = s.exec(fmt.Sprintf("CREATE INDEX %s ON %s(%s)", name, table, cols))
+	} else {
+		s.exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(%s)", name, table, cols))
+	}
+}
+
+// createUniqueIndex 创建唯一索引, MySQL 不支持 IF NOT EXISTS 时忽略已存在错误。
+func (s *Store) createUniqueIndex(name, table, cols string) {
+	if s.dialect == "mysql" {
+		_, _ = s.exec(fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s(%s)", name, table, cols))
+	} else {
+		s.exec(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s(%s)", name, table, cols))
+	}
 }
 
 // Close 关闭底层数据库。
@@ -138,12 +233,19 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Ping 检查底层数据库连接是否可用, 用于健康检查。
+func (s *Store) Ping() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.db.Ping()
+}
+
 // TokenCount 返回未撤销的 token 数量。
 func (s *Store) TokenCount() (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE revoked=0`).Scan(&n)
+	err := s.queryRow(`SELECT COUNT(*) FROM tokens WHERE revoked=0`).Scan(&n)
 	return n, err
 }
 
@@ -154,8 +256,16 @@ func (s *Store) EnsureToken(rawToken, note, boundAgentID string) error {
 	defer s.mu.Unlock()
 	h := HashToken(rawToken)
 	prefix := TokenPrefix(rawToken)
-	_, err := s.db.Exec(`INSERT OR IGNORE INTO tokens(token, token_prefix, note, created_at, bound_agent_id) VALUES(?,?,?,?,?)`,
-		h, prefix, note, time.Now().Unix(), boundAgentID)
+	var sql string
+	switch s.dialect {
+	case "mysql":
+		sql = `INSERT IGNORE INTO tokens(token, token_prefix, note, created_at, bound_agent_id) VALUES(?,?,?,?,?)`
+	case "postgres":
+		sql = `INSERT INTO tokens(token, token_prefix, note, created_at, bound_agent_id) VALUES(?,?,?,?,?) ON CONFLICT(token) DO NOTHING`
+	default:
+		sql = `INSERT OR IGNORE INTO tokens(token, token_prefix, note, created_at, bound_agent_id) VALUES(?,?,?,?,?)`
+	}
+	_, err := s.exec(sql, h, prefix, note, time.Now().Unix(), boundAgentID)
 	return err
 }
 
@@ -170,14 +280,14 @@ func (s *Store) ListTokensPaged(page, pageSize int) ([]TokenRow, int, error) {
 	if pageSize > 1000 {
 		pageSize = 1000
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens`).Scan(&total); err != nil {
+	if err := s.queryRow(`SELECT COUNT(*) FROM tokens`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	offset := (page - 1) * pageSize
-	rows, err := s.db.Query(`SELECT token, COALESCE(token_prefix,''), note, created_at, revoked, COALESCE(bound_agent_id,'') FROM tokens ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+	rows, err := s.query(`SELECT token, COALESCE(token_prefix,''), note, created_at, revoked, COALESCE(bound_agent_id,'') FROM tokens ORDER BY created_at DESC LIMIT ? OFFSET ?`,
 		pageSize, offset)
 	if err != nil {
 		return nil, 0, err
@@ -208,7 +318,7 @@ func (s *Store) DeleteToken(tokenOrHash string) error {
 		h = HashToken(tokenOrHash)
 	}
 	var revoked int
-	err := s.db.QueryRow(`SELECT revoked FROM tokens WHERE token=?`, h).Scan(&revoked)
+	err := s.queryRow(`SELECT revoked FROM tokens WHERE token=?`, h).Scan(&revoked)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("token not found")
 	}
@@ -218,16 +328,16 @@ func (s *Store) DeleteToken(tokenOrHash string) error {
 	if revoked == 0 {
 		return fmt.Errorf("token not revoked, refuse delete")
 	}
-	_, err = s.db.Exec(`DELETE FROM tokens WHERE token=?`, h)
+	_, err = s.exec(`DELETE FROM tokens WHERE token=?`, h)
 	return err
 }
 
 // BoundAgentIDForToken 返回某 token 哈希所绑定的 agent_id；未绑定返回空。
 func (s *Store) BoundAgentIDForToken(tokenHash string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var b sql.NullString
-	_ = s.db.QueryRow(`SELECT bound_agent_id FROM tokens WHERE token=?`, tokenHash).Scan(&b)
+	_ = s.queryRow(`SELECT bound_agent_id FROM tokens WHERE token=?`, tokenHash).Scan(&b)
 	return b.String
 }
 
@@ -242,12 +352,12 @@ func (s *Store) BoundAgentIDForToken(tokenHash string) string {
 //   - bound_agent_id == agentID: bound=true, unbound=false
 //   - 否则(冒名): bound=false, unbound=false
 func (s *Store) CheckTokenBindAgent(rawToken, agentID string) (bound bool, unbound bool, boundTo string, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	h := HashToken(rawToken)
 	var revoked int
 	var existing sql.NullString
-	err = s.db.QueryRow(`SELECT revoked, bound_agent_id FROM tokens WHERE token=?`, h).Scan(&revoked, &existing)
+	err = s.queryRow(`SELECT revoked, bound_agent_id FROM tokens WHERE token=?`, h).Scan(&revoked, &existing)
 	if err == sql.ErrNoRows {
 		return false, false, "", nil
 	}
@@ -276,7 +386,7 @@ func (s *Store) BindToken(tokenOrHash, agentID string) error {
 	if len(h) != 64 {
 		h = HashToken(tokenOrHash)
 	}
-	_, err := s.db.Exec(`UPDATE tokens SET bound_agent_id=? WHERE token=?`, agentID, h)
+	_, err := s.exec(`UPDATE tokens SET bound_agent_id=? WHERE token=?`, agentID, h)
 	return err
 }
 
@@ -288,22 +398,22 @@ func (s *Store) RevokeToken(tokenOrHash string) error {
 	if len(h) != 64 {
 		h = HashToken(tokenOrHash)
 	}
-	_, err := s.db.Exec(`UPDATE tokens SET revoked=1 WHERE token=?`, h)
+	_, err := s.exec(`UPDATE tokens SET revoked=1 WHERE token=?`, h)
 	if err != nil {
 		return err
 	}
 	// agent 表里 token 字段存的是原始 token(便于归属查询), 这里撤销时把所有用此 token 的 agent 置离线
-	_, _ = s.db.Exec(`UPDATE agents SET online=0 WHERE token=?`, h)
+	_, _ = s.exec(`UPDATE agents SET online=0 WHERE token=?`, h)
 	return nil
 }
 
 // ValidToken 校验原始 token 是否存在且未撤销。
 func (s *Store) ValidToken(rawToken string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	h := HashToken(rawToken)
 	var revoked int
-	err := s.db.QueryRow(`SELECT revoked FROM tokens WHERE token=?`, h).Scan(&revoked)
+	err := s.queryRow(`SELECT revoked FROM tokens WHERE token=?`, h).Scan(&revoked)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -329,7 +439,7 @@ func (s *Store) TouchAgent(agentID, rawToken, hostname, osName, ip string) (bool
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var exists int
-	err := s.db.QueryRow(`SELECT 1 FROM agents WHERE agent_id=?`, agentID).Scan(&exists)
+	err := s.queryRow(`SELECT 1 FROM agents WHERE agent_id=?`, agentID).Scan(&exists)
 	first := false
 	if err == sql.ErrNoRows {
 		first = true
@@ -339,7 +449,7 @@ func (s *Store) TouchAgent(agentID, rawToken, hostname, osName, ip string) (bool
 		return false, err
 	}
 	h := HashToken(rawToken)
-	_, err = s.db.Exec(`INSERT INTO agents(agent_id, token, hostname, os, ip, last_seen, online)
+	_, err = s.exec(`INSERT INTO agents(agent_id, token, hostname, os, ip, last_seen, online)
 		VALUES(?,?,?,?,?,?,1)
 		ON CONFLICT(agent_id) DO UPDATE SET
 		  token=excluded.token,
@@ -356,7 +466,7 @@ func (s *Store) TouchAgent(agentID, rawToken, hostname, osName, ip string) (bool
 func (s *Store) SetAgentTags(agentID string, tags []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE agents SET tags=? WHERE agent_id=?`,
+	_, err := s.exec(`UPDATE agents SET tags=? WHERE agent_id=?`,
 		strings.Join(tags, ","), agentID)
 	return err
 }
@@ -365,25 +475,25 @@ func (s *Store) SetAgentTags(agentID string, tags []string) error {
 func (s *Store) SetAgentNotes(agentID, notes string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE agents SET notes=? WHERE agent_id=?`, notes, agentID)
+	_, err := s.exec(`UPDATE agents SET notes=? WHERE agent_id=?`, notes, agentID)
 	return err
 }
 
 func (s *Store) OfflineAgent(agentID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE agents SET online=0 WHERE agent_id=?`, agentID)
+	_, err := s.exec(`UPDATE agents SET online=0 WHERE agent_id=?`, agentID)
 	return err
 }
 
 // GetAgentByID 按 agent_id 取一行, 不存在返回 (nil, nil)。
 func (s *Store) GetAgentByID(agentID string) (*AgentRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var a AgentRow
 	var ls sql.NullInt64
 	var tags sql.NullString
-	err := s.db.QueryRow(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE agent_id=?`, agentID).
+	err := s.queryRow(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE agent_id=?`, agentID).
 		Scan(&a.AgentID, &a.Hostname, &a.IP, &a.Online, &ls, &tags)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -403,9 +513,9 @@ func (s *Store) GetAgentByID(agentID string) (*AgentRow, error) {
 // ListAgentsStale 返回 last_seen 早于 cutoff 的 agent(不论 online 列), 用于告警扫描。
 // audit_log 路径不调用此函数; 仅 alert checker 用。
 func (s *Store) ListAgentsStale(cutoff time.Time) ([]AgentRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE last_seen < ?`, cutoff.Unix())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.query(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE last_seen < ?`, cutoff.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -431,9 +541,9 @@ func (s *Store) ListAgentsStale(cutoff time.Time) ([]AgentRow, error) {
 
 // ListAgentsSeenSince 返回 last_seen >= since 的 agent, 用于告警恢复扫描。
 func (s *Store) ListAgentsSeenSince(since time.Time) ([]AgentRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE last_seen >= ?`, since.Unix())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.query(`SELECT agent_id, hostname, ip, online, last_seen, COALESCE(tags,'') FROM agents WHERE last_seen >= ?`, since.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +573,7 @@ func (s *Store) SweepStaleAgents(timeout time.Duration) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	threshold := time.Now().Add(-timeout).Unix()
-	rows, err := s.db.Query(`SELECT agent_id FROM agents WHERE online=1 AND last_seen < ?`, threshold)
+	rows, err := s.query(`SELECT agent_id FROM agents WHERE online=1 AND last_seen < ?`, threshold)
 	if err != nil {
 		return nil, err
 	}
@@ -478,7 +588,7 @@ func (s *Store) SweepStaleAgents(timeout time.Duration) ([]string, error) {
 	}
 	rows.Close()
 	for _, id := range ids {
-		_, _ = s.db.Exec(`UPDATE agents SET online=0 WHERE agent_id=? AND online=1`, id)
+		_, _ = s.exec(`UPDATE agents SET online=0 WHERE agent_id=? AND online=1`, id)
 	}
 	return ids, nil
 }
@@ -486,19 +596,19 @@ func (s *Store) SweepStaleAgents(timeout time.Duration) ([]string, error) {
 func (s *Store) MarkSeen(agentID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE agents SET last_seen=?, online=1 WHERE agent_id=?`, time.Now().Unix(), agentID)
+	_, err := s.exec(`UPDATE agents SET last_seen=?, online=1 WHERE agent_id=?`, time.Now().Unix(), agentID)
 	return err
 }
 
 // GetAgent 返回单个 agent 详情。
 func (s *Store) GetAgent(agentID string) (*AgentRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var a AgentRow
 	var ls int64
 	var online int
 	var tags, notes, ip sql.NullString
-	err := s.db.QueryRow(`SELECT agent_id, token, hostname, os, ip, tags, notes, last_seen, online FROM agents WHERE agent_id=?`, agentID).
+	err := s.queryRow(`SELECT agent_id, token, hostname, os, ip, tags, notes, last_seen, online FROM agents WHERE agent_id=?`, agentID).
 		Scan(&a.AgentID, &a.Token, &a.Hostname, &a.OS, &ip, &tags, &notes, &ls, &online)
 	if err != nil {
 		return nil, err
@@ -519,7 +629,7 @@ func (s *Store) SaveCmd(c *StoredCmd) error {
 	defer s.mu.Unlock()
 	sanitized := sanitizeParams(c.Params)
 	params, _ := json.Marshal(sanitized)
-	_, err := s.db.Exec(`INSERT INTO commands(id, agent_id, action, user, params, created_at, created_by, status)
+	_, err := s.exec(`INSERT INTO commands(id, agent_id, action, user, params, created_at, created_by, status)
 		VALUES(?,?,?,?,?,?,?,?)`,
 		c.ID, c.AgentID, c.Action, c.User, string(params), time.Now().Unix(), c.CreatedBy, "pending")
 	return err
@@ -545,7 +655,7 @@ func sanitizeParams(p map[string]string) map[string]string {
 func (s *Store) FinishCmd(id string, r *ResultBody) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE commands SET status=?, output=?, err=?, finished_at=? WHERE id=?`,
+	_, err := s.exec(`UPDATE commands SET status=?, output=?, err=?, finished_at=? WHERE id=?`,
 		boolStatus(r.OK), r.Output, r.Err, time.Now().Unix(), id)
 	return err
 }
@@ -554,9 +664,29 @@ func (s *Store) FinishCmd(id string, r *ResultBody) error {
 func (s *Store) TimeoutCmd(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE commands SET status='timeout', err='agent no response within timeout', finished_at=? WHERE id=? AND status='pending'`,
+	_, err := s.exec(`UPDATE commands SET status='timeout', err='agent no response within timeout', finished_at=? WHERE id=? AND status='pending'`,
 		time.Now().Unix(), id)
 	return err
+}
+
+// PendingCmdIDs 返回指定 agent 所有 pending 状态的指令 ID（用于重连后重发）。
+func (s *Store) PendingCmdIDs(agentID string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.query(`SELECT id FROM commands WHERE agent_id=? AND status='pending'`, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // SweepTimeouts 扫描超过 timeout 仍 pending 的指令并标记为 timeout，返回被超时的 id 列表。
@@ -564,7 +694,7 @@ func (s *Store) SweepTimeouts(timeout time.Duration) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	threshold := time.Now().Add(-timeout).Unix()
-	rows, err := s.db.Query(`SELECT id FROM commands WHERE status='pending' AND created_at < ?`, threshold)
+	rows, err := s.query(`SELECT id FROM commands WHERE status='pending' AND created_at < ?`, threshold)
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +709,7 @@ func (s *Store) SweepTimeouts(timeout time.Duration) ([]string, error) {
 	}
 	rows.Close()
 	for _, id := range ids {
-		_, _ = s.db.Exec(`UPDATE commands SET status='timeout', err='no response', finished_at=? WHERE id=? AND status='pending'`,
+		_, _ = s.exec(`UPDATE commands SET status='timeout', err='no response', finished_at=? WHERE id=? AND status='pending'`,
 			time.Now().Unix(), id)
 	}
 	return ids, nil
@@ -597,22 +727,22 @@ func (s *Store) ListAgentsPaged(page, pageSize int, q string) ([]AgentRow, int, 
 	if pageSize > 1000 {
 		pageSize = 1000
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	where := ""
 	args := []interface{}{}
 	if q != "" {
-		where = " WHERE (hostname LIKE ? OR ip LIKE ? OR agent_id LIKE ? OR COALESCE(tags,'') LIKE ?)"
-		p := "%" + q + "%"
+		where = " WHERE (hostname LIKE ? ESCAPE '\\' OR ip LIKE ? ESCAPE '\\' OR agent_id LIKE ? ESCAPE '\\' OR COALESCE(tags,'') LIKE ? ESCAPE '\\')"
+		p := "%" + escapeLike(q) + "%"
 		args = append(args, p, p, p, p)
 	}
 	var total int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM agents"+where, args...).Scan(&total); err != nil {
+	if err := s.queryRow("SELECT COUNT(*) FROM agents"+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	offset := (page - 1) * pageSize
 	args = append(args, pageSize, offset)
-	rows, err := s.db.Query("SELECT agent_id, token, hostname, os, ip, COALESCE(tags,''), COALESCE(notes,''), last_seen, online FROM agents"+
+	rows, err := s.query("SELECT agent_id, token, hostname, os, ip, COALESCE(tags,''), COALESCE(notes,''), last_seen, online FROM agents"+
 		where+" ORDER BY online DESC, hostname LIMIT ? OFFSET ?", args...)
 	if err != nil {
 		return nil, 0, err
@@ -646,7 +776,7 @@ func (s *Store) DeleteAgent(agentID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var online int
-	err := s.db.QueryRow(`SELECT online FROM agents WHERE agent_id=?`, agentID).Scan(&online)
+	err := s.queryRow(`SELECT online FROM agents WHERE agent_id=?`, agentID).Scan(&online)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -657,17 +787,17 @@ func (s *Store) DeleteAgent(agentID string) (bool, error) {
 		return false, fmt.Errorf("agent online, refuse delete")
 	}
 	// 不要保留已删 agent 的命令历史(无主), 否则破坏归属完整性
-	_, _ = s.db.Exec("DELETE FROM commands WHERE agent_id=?", agentID)
-	_, err = s.db.Exec("DELETE FROM agents WHERE agent_id=?", agentID)
+	_, _ = s.exec("DELETE FROM commands WHERE agent_id=?", agentID)
+	_, err = s.exec("DELETE FROM agents WHERE agent_id=?", agentID)
 	return err == nil, err
 }
 
 // HostnameOf 返回 agent_id 对应 hostname, 找不到返回空。
 func (s *Store) HostnameOf(agentID string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var h sql.NullString
-	_ = s.db.QueryRow("SELECT hostname FROM agents WHERE agent_id=?", agentID).Scan(&h)
+	_ = s.queryRow("SELECT hostname FROM agents WHERE agent_id=?", agentID).Scan(&h)
 	return h.String
 }
 
@@ -682,8 +812,8 @@ func (s *Store) ListCmdsPaged(page, pageSize int, agentID, actionFilter string) 
 	if pageSize > 1000 {
 		pageSize = 1000
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	where := ""
 	args := []interface{}{}
 	if agentID != "" {
@@ -699,14 +829,14 @@ func (s *Store) ListCmdsPaged(page, pageSize int, agentID, actionFilter string) 
 		args = append(args, actionFilter)
 	}
 	var total int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM commands"+where, args...).Scan(&total); err != nil {
+	if err := s.queryRow("SELECT COUNT(*) FROM commands"+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	offset := (page - 1) * pageSize
 	args = append(args, pageSize, offset)
 	q := `SELECT id, agent_id, action, user, created_at, status, COALESCE(output,''), COALESCE(err,''), COALESCE(finished_at,0), COALESCE(created_by,'') FROM commands` +
 		where + " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -729,11 +859,11 @@ func (s *Store) ListCmdsPaged(page, pageSize int, agentID, actionFilter string) 
 
 // GetCmd 按 id 直接取单条指令，避免 ListCmds 全表扫描。
 func (s *Store) GetCmd(id string) (*CmdRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var c CmdRow
 	var created, finished int64
-	err := s.db.QueryRow(`SELECT id, agent_id, action, user, created_at, status, COALESCE(output,''), COALESCE(err,''), COALESCE(finished_at,0), COALESCE(created_by,'') FROM commands WHERE id=?`, id).
+	err := s.queryRow(`SELECT id, agent_id, action, user, created_at, status, COALESCE(output,''), COALESCE(err,''), COALESCE(finished_at,0), COALESCE(created_by,'') FROM commands WHERE id=?`, id).
 		Scan(&c.ID, &c.AgentID, &c.Action, &c.User, &created, &c.Status, &c.Output, &c.Err, &finished, &c.CreatedBy)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -752,7 +882,7 @@ func (s *Store) GetCmd(id string) (*CmdRow, error) {
 func (s *Store) Audit(actor, action, target, detail, ip string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`INSERT INTO audit_log(ts, actor, action, target, detail, ip) VALUES(?,?,?,?,?,?)`,
+	_, err := s.exec(`INSERT INTO audit_log(ts, actor, action, target, detail, ip) VALUES(?,?,?,?,?,?)`,
 		time.Now().Unix(), actor, action, target, detail, ip)
 	return err
 }
@@ -784,8 +914,8 @@ func (f *AuditFilter) normalize() {
 // ListAuditPaged 按条件分页返回审计日志与总数。
 func (s *Store) ListAuditPaged(f AuditFilter) ([]AuditRow, int, error) {
 	f.normalize()
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	where := " WHERE 1=1"
 	args := []interface{}{}
 	if f.Actor != "" {
@@ -797,12 +927,12 @@ func (s *Store) ListAuditPaged(f AuditFilter) ([]AuditRow, int, error) {
 		args = append(args, f.Action)
 	}
 	if f.Target != "" {
-		where += " AND target LIKE ?"
-		args = append(args, "%"+f.Target+"%")
+		where += " AND target LIKE ? ESCAPE '\\'"
+		args = append(args, "%"+escapeLike(f.Target)+"%")
 	}
 	if f.Q != "" {
-		where += " AND (actor LIKE ? OR action LIKE ? OR target LIKE ? OR detail LIKE ?)"
-		p := "%" + f.Q + "%"
+		where += " AND (actor LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')"
+		p := "%" + escapeLike(f.Q) + "%"
 		args = append(args, p, p, p, p)
 	}
 	if f.From > 0 {
@@ -814,14 +944,14 @@ func (s *Store) ListAuditPaged(f AuditFilter) ([]AuditRow, int, error) {
 		args = append(args, f.To)
 	}
 	var total int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM audit_log"+where, args...).Scan(&total); err != nil {
+	if err := s.queryRow("SELECT COUNT(*) FROM audit_log"+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	offset := (f.Page - 1) * f.PageSize
 	args = append(args, f.PageSize, offset)
 	q := "SELECT id, ts, actor, action, COALESCE(target,''), COALESCE(detail,''), COALESCE(ip,'') FROM audit_log" +
 		where + " ORDER BY ts DESC LIMIT ? OFFSET ?"
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -841,9 +971,9 @@ func (s *Store) ListAuditPaged(f AuditFilter) ([]AuditRow, int, error) {
 
 // AuditActions 返回 audit_log 中出现过的所有动作类型(SELECT DISTINCT)。
 func (s *Store) AuditActions() ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT DISTINCT action FROM audit_log ORDER BY action`)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.query(`SELECT DISTINCT action FROM audit_log ORDER BY action`)
 	if err != nil {
 		return nil, err
 	}
@@ -861,10 +991,10 @@ func (s *Store) AuditActions() ([]string, error) {
 
 // SettingGet / SettingSet 提供简单键值存储，用于 admin password 等。
 func (s *Store) SettingGet(k string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var v string
-	err := s.db.QueryRow(`SELECT v FROM settings WHERE k=?`, k).Scan(&v)
+	err := s.queryRow(`SELECT v FROM settings WHERE k=?`, k).Scan(&v)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -874,9 +1004,14 @@ func (s *Store) SettingGet(k string) (string, error) {
 func (s *Store) SettingSet(k, v string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`INSERT INTO settings(k, v, updated_at) VALUES(?,?,?)
-		ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at`,
-		k, v, time.Now().Unix())
+	now := time.Now().Unix()
+	var sql string
+	if s.dialect == "mysql" {
+		sql = `INSERT INTO settings(k, v, updated_at) VALUES(?,?,?) ON DUPLICATE KEY UPDATE v=VALUES(v), updated_at=VALUES(updated_at)`
+	} else {
+		sql = `INSERT INTO settings(k, v, updated_at) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at`
+	}
+	_, err := s.exec(sql, k, v, now)
 	return err
 }
 
@@ -889,7 +1024,7 @@ func (s *Store) DeleteSessionsByActor(actor string) {
 	defer s.mu.Unlock()
 	// v 格式: "username|role|expires"，用 LIKE "actor|%" 匹配以 actor| 开头的行。
 	// escapeLike 转义 actor 中的 % 和 _，防止 LIKE 通配符注入。
-	rows, err := s.db.Query(`SELECT k FROM settings WHERE k LIKE 'session:%' AND v LIKE ? ESCAPE '\'`,
+	rows, err := s.query(`SELECT k FROM settings WHERE k LIKE 'session:%' AND v LIKE ? ESCAPE '\'`,
 		escapeLike(actor)+"|%")
 	if err != nil {
 		return
@@ -903,7 +1038,7 @@ func (s *Store) DeleteSessionsByActor(actor string) {
 	}
 	rows.Close()
 	for _, k := range keys {
-		_, _ = s.db.Exec(`DELETE FROM settings WHERE k=?`, k)
+		_, _ = s.exec(`DELETE FROM settings WHERE k=?`, k)
 	}
 }
 
@@ -923,32 +1058,34 @@ type UserRow struct {
 	ID        int64  `json:"id"`
 	Username  string `json:"username"`
 	Role      string `json:"role"`
+	Email     string `json:"email"`
 	Disabled  bool   `json:"disabled"`
 	CreatedAt int64  `json:"created_at"`
 }
 
 // CreateUser 创建用户; username 唯一, password 已被 bcrypt 哈希。
-func (s *Store) CreateUser(username, passwordHash, role string) error {
+func (s *Store) CreateUser(username, passwordHash, role, email string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if role == "" {
 		role = "operator"
 	}
-	_, err := s.db.Exec(`INSERT INTO users(username, password_hash, role, created_at) VALUES(?,?,?,?)`,
-		username, passwordHash, role, time.Now().Unix())
+	_, err := s.exec(`INSERT INTO users(username, password_hash, role, created_at, email) VALUES(?,?,?,?,?)`,
+		username, passwordHash, role, time.Now().Unix(), email)
 	return err
 }
 
 // GetUser 按 username 取一个用户(含 password_hash)。
 func (s *Store) GetUser(username string) (*UserRow, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var u UserRow
 	var created int64
 	var disabled int
 	var hash string
-	err := s.db.QueryRow(`SELECT id, username, password_hash, role, created_at, disabled FROM users WHERE username=?`, username).
-		Scan(&u.ID, &u.Username, &hash, &u.Role, &created, &disabled)
+	var email sql.NullString
+	err := s.queryRow(`SELECT id, username, password_hash, role, created_at, disabled, email FROM users WHERE username=?`, username).
+		Scan(&u.ID, &u.Username, &hash, &u.Role, &created, &disabled, &email)
 	if err == sql.ErrNoRows {
 		return nil, "", nil
 	}
@@ -957,14 +1094,24 @@ func (s *Store) GetUser(username string) (*UserRow, string, error) {
 	}
 	u.Disabled = disabled == 1
 	u.CreatedAt = created
+	u.Email = email.String
 	return &u, hash, nil
+}
+
+// CountUsers 返回用户总数。
+func (s *Store) CountUsers() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int
+	err := s.queryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, err
 }
 
 // ListUsers 列出所有用户(不含 password_hash)。
 func (s *Store) ListUsers() ([]UserRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT id, username, role, created_at, disabled FROM users ORDER BY id`)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.query(`SELECT id, username, role, created_at, disabled, email FROM users ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -974,12 +1121,41 @@ func (s *Store) ListUsers() ([]UserRow, error) {
 		var u UserRow
 		var created int64
 		var disabled int
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &created, &disabled); err != nil {
+		var email sql.NullString
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &created, &disabled, &email); err != nil {
 			return nil, err
 		}
 		u.Disabled = disabled == 1
 		u.CreatedAt = created
+		u.Email = email.String
 		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// UpdateUserEmail 更新用户邮箱。admin 可改任意用户, 普通用户只能改自己。
+func (s *Store) UpdateUserEmail(username, email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.exec(`UPDATE users SET email=? WHERE username=?`, email, username)
+	return err
+}
+
+// ListAdminEmails 返回所有未禁用 admin 用户的邮箱列表(去空), 用于告警通知。
+func (s *Store) ListAdminEmails() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.query(`SELECT email FROM users WHERE role='admin' AND disabled=0 AND email IS NOT NULL AND email<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var e string
+		if err := rows.Scan(&e); err == nil && e != "" {
+			out = append(out, e)
+		}
 	}
 	return out, rows.Err()
 }
@@ -988,7 +1164,7 @@ func (s *Store) ListUsers() ([]UserRow, error) {
 func (s *Store) SetUserPassword(username, passwordHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE users SET password_hash=? WHERE username=?`, passwordHash, username)
+	_, err := s.exec(`UPDATE users SET password_hash=? WHERE username=?`, passwordHash, username)
 	return err
 }
 
@@ -1000,7 +1176,7 @@ func (s *Store) SetUserDisabled(username string, disabled bool) error {
 	if disabled {
 		d = 1
 	}
-	_, err := s.db.Exec(`UPDATE users SET disabled=? WHERE username=?`, d, username)
+	_, err := s.exec(`UPDATE users SET disabled=? WHERE username=?`, d, username)
 	return err
 }
 
@@ -1008,16 +1184,16 @@ func (s *Store) SetUserDisabled(username string, disabled bool) error {
 func (s *Store) DeleteUser(username string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM users WHERE username=?`, username)
+	_, err := s.exec(`DELETE FROM users WHERE username=?`, username)
 	return err
 }
 
 // CountAdmins 返回未禁用的 admin 用户数(用于防止删除最后一个 admin)。
 func (s *Store) CountAdmins() (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role='admin' AND disabled=0`).Scan(&n)
+	err := s.queryRow(`SELECT COUNT(*) FROM users WHERE role='admin' AND disabled=0`).Scan(&n)
 	return n, err
 }
 
@@ -1027,12 +1203,12 @@ func (s *Store) PurgeOlderThan(cutoff time.Time) (auditRows, cmdRows int64, err 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := cutoff.Unix()
-	r, e := s.db.Exec(`DELETE FROM audit_log WHERE ts < ?`, c)
+	r, e := s.exec(`DELETE FROM audit_log WHERE ts < ?`, c)
 	if e != nil {
 		return 0, 0, e
 	}
 	auditRows, _ = r.RowsAffected()
-	r, e = s.db.Exec(`DELETE FROM commands WHERE created_at < ?`, c)
+	r, e = s.exec(`DELETE FROM commands WHERE created_at < ?`, c)
 	if e != nil {
 		return auditRows, 0, e
 	}
@@ -1109,9 +1285,6 @@ type AuditRow struct {
 	IP     string    `json:"ip"`
 }
 
-// keep fmt import (used indirectly through tests / future)
-var _ = fmt.Sprintf
-
 // ---- Shell 规则管理 ----
 
 // ShellRule 描述一条 shell 黑/白名单规则。
@@ -1127,8 +1300,8 @@ type ShellRule struct {
 
 // ListShellRules 返回指定类型的规则列表; enabledOnly=true 时只返回启用的规则。
 func (s *Store) ListShellRules(ruleType string, enabledOnly bool) ([]ShellRule, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	q := `SELECT id, type, pattern, COALESCE(note,''), enabled, created_at, updated_at FROM shell_rules`
 	args := []interface{}{}
 	if ruleType != "" {
@@ -1143,7 +1316,7 @@ func (s *Store) ListShellRules(ruleType string, enabledOnly bool) ([]ShellRule, 
 		}
 	}
 	q += ` ORDER BY type, id`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1168,7 +1341,13 @@ func (s *Store) AddShellRule(ruleType, pattern, note string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().Unix()
-	res, err := s.db.Exec(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+	if s.dialect == "postgres" {
+		var id int64
+		err := s.queryRow(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?) RETURNING id`,
+			ruleType, pattern, note, 1, now, now).Scan(&id)
+		return id, err
+	}
+	res, err := s.exec(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
 		ruleType, pattern, note, 1, now, now)
 	if err != nil {
 		return 0, err
@@ -1184,7 +1363,7 @@ func (s *Store) UpdateShellRule(id int64, pattern, note string, enabled bool) er
 	if enabled {
 		e = 1
 	}
-	_, err := s.db.Exec(`UPDATE shell_rules SET pattern=?, note=?, enabled=?, updated_at=? WHERE id=?`,
+	_, err := s.exec(`UPDATE shell_rules SET pattern=?, note=?, enabled=?, updated_at=? WHERE id=?`,
 		pattern, note, e, time.Now().Unix(), id)
 	return err
 }
@@ -1193,16 +1372,52 @@ func (s *Store) UpdateShellRule(id int64, pattern, note string, enabled bool) er
 func (s *Store) DeleteShellRule(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM shell_rules WHERE id=?`, id)
+	_, err := s.exec(`DELETE FROM shell_rules WHERE id=?`, id)
 	return err
 }
 
 // CountShellRules 返回 shell_rules 表总行数, 用于判断是否需要种子默认数据。
 func (s *Store) CountShellRules() (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM shell_rules`).Scan(&n)
+	err := s.queryRow(`SELECT COUNT(*) FROM shell_rules`).Scan(&n)
+	return n, err
+}
+
+// CountAgents 返回已注册 agent 总数。
+func (s *Store) CountAgents() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int
+	err := s.queryRow(`SELECT COUNT(*) FROM agents`).Scan(&n)
+	return n, err
+}
+
+// CountCmds 返回历史指令总数。
+func (s *Store) CountCmds() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int
+	err := s.queryRow(`SELECT COUNT(*) FROM commands`).Scan(&n)
+	return n, err
+}
+
+// CountAudit 返回审计日志总数。
+func (s *Store) CountAudit() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int
+	err := s.queryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&n)
+	return n, err
+}
+
+// CountAccountScans 返回账户扫描记录总数。
+func (s *Store) CountAccountScans() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int
+	err := s.queryRow(`SELECT COUNT(*) FROM account_scans`).Scan(&n)
 	return n, err
 }
 
@@ -1211,7 +1426,7 @@ func (s *Store) SeedShellRules() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM shell_rules`).Scan(&n); err != nil {
+	if err := s.queryRow(`SELECT COUNT(*) FROM shell_rules`).Scan(&n); err != nil {
 		return fmt.Errorf("seed: count shell_rules: %w", err)
 	}
 	if n > 0 {
@@ -1265,15 +1480,16 @@ func (s *Store) SeedShellRules() error {
 	if err != nil {
 		return fmt.Errorf("seed: begin tx: %w", err)
 	}
+	insertSQL := s.rebind(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`)
 	for _, r := range whitelist {
-		if _, err := tx.Exec(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+		if _, err := tx.Exec(insertSQL,
 			"whitelist", r.pattern, r.note, 1, now, now); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("seed: insert whitelist %q: %w", r.pattern, err)
 		}
 	}
 	for _, r := range blacklist {
-		if _, err := tx.Exec(`INSERT INTO shell_rules(type, pattern, note, enabled, created_at, updated_at) VALUES(?,?,?,?,?,?)`,
+		if _, err := tx.Exec(insertSQL,
 			"blacklist", r.pattern, r.note, 1, now, now); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("seed: insert blacklist %q: %w", r.pattern, err)
@@ -1315,16 +1531,26 @@ func (s *Store) UpsertAccountScan(agentID string, accounts []AccountScanRow) err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().Unix()
-	for _, a := range accounts {
-		a.AgentID = agentID
-		a.ScanTs = now
-		_, err := s.db.Exec(`INSERT INTO account_scans(agent_id, username, uid, status, last_change, expire_date, password_expire, inactive_days, min_days, max_days, warn_days, scan_ts)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-			ON CONFLICT(agent_id, username) DO UPDATE SET
+	cols := "agent_id, username, uid, status, last_change, expire_date, password_expire, inactive_days, min_days, max_days, warn_days, scan_ts"
+	placeholders := "?,?,?,?,?,?,?,?,?,?,?,?"
+	var conflict string
+	if s.dialect == "mysql" {
+		conflict = `ON DUPLICATE KEY UPDATE uid=VALUES(uid), status=VALUES(status), last_change=VALUES(last_change),
+				expire_date=VALUES(expire_date), password_expire=VALUES(password_expire),
+				inactive_days=VALUES(inactive_days), min_days=VALUES(min_days),
+				max_days=VALUES(max_days), warn_days=VALUES(warn_days), scan_ts=VALUES(scan_ts)`
+	} else {
+		conflict = `ON CONFLICT(agent_id, username) DO UPDATE SET
 				uid=excluded.uid, status=excluded.status, last_change=excluded.last_change,
 				expire_date=excluded.expire_date, password_expire=excluded.password_expire,
 				inactive_days=excluded.inactive_days, min_days=excluded.min_days,
-				max_days=excluded.max_days, warn_days=excluded.warn_days, scan_ts=excluded.scan_ts`,
+				max_days=excluded.max_days, warn_days=excluded.warn_days, scan_ts=excluded.scan_ts`
+	}
+	upsertSQL := s.rebind(fmt.Sprintf(`INSERT INTO account_scans(%s) VALUES(%s) %s`, cols, placeholders, conflict))
+	for _, a := range accounts {
+		a.AgentID = agentID
+		a.ScanTs = now
+		_, err := s.db.Exec(upsertSQL,
 			a.AgentID, a.Username, a.UID, a.Status, a.LastChange, a.ExpireDate,
 			a.PasswordExpire, a.InactiveDays, a.MinDays, a.MaxDays, a.WarnDays, now)
 		if err != nil {
@@ -1336,8 +1562,8 @@ func (s *Store) UpsertAccountScan(agentID string, accounts []AccountScanRow) err
 
 // ListAccountScans 返回指定 agent 的账户扫描结果, 可按 status 过滤。
 func (s *Store) ListAccountScans(agentID, statusFilter string) ([]AccountScanRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	q := `SELECT id, agent_id, username, uid, status, last_change, expire_date,
 		password_expire, inactive_days, min_days, max_days, warn_days, scan_ts
 		FROM account_scans`
@@ -1356,7 +1582,7 @@ func (s *Store) ListAccountScans(agentID, statusFilter string) ([]AccountScanRow
 		args = append(args, statusFilter)
 	}
 	q += cond + " ORDER BY agent_id, username"
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1388,12 +1614,12 @@ type AccountScanSummary struct {
 
 // GetAccountScanSummary 返回全局账户状态汇总。
 func (s *Store) GetAccountScanSummary() (AccountScanSummary, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var sum AccountScanSummary
 	count := func(status string) int {
 		var n int
-		s.db.QueryRow(`SELECT COUNT(*) FROM account_scans WHERE status=?`, status).Scan(&n)
+		s.queryRow(`SELECT COUNT(*) FROM account_scans WHERE status=?`, status).Scan(&n)
 		return n
 	}
 	sum.Active = count("active")
@@ -1411,7 +1637,7 @@ func (s *Store) GetAccountScanSummary() (AccountScanSummary, error) {
 func (s *Store) CleanAccountScans(cutoff time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, err := s.db.Exec(`DELETE FROM account_scans WHERE scan_ts < ?`, cutoff.Unix())
+	r, err := s.exec(`DELETE FROM account_scans WHERE scan_ts < ?`, cutoff.Unix())
 	if err != nil {
 		return 0, err
 	}

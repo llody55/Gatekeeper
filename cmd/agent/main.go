@@ -26,6 +26,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	config.ApplyLogLevel(cfg.LogLevel)
 
 	if *server != "" {
 		cfg.ServerURL = *server

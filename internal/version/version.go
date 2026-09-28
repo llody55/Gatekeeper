@@ -7,7 +7,7 @@ package version
 // VERSION 是当前发布版本号, 与仓库根目录 VERSION 文件保持一致。
 // 使用 var 而非 const, 以便 -ldflags -X 在构建时注入覆盖。
 // 修改版本只需更新 VERSION 文件, make build 会自动注入。
-var VERSION = "0.7.0"
+var VERSION = "0.8.0"
 
 // String 返回版本号字符串, 供 log / API / UI 引用。
 func String() string { return VERSION }

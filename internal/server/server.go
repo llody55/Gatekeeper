@@ -33,6 +33,15 @@ type Server struct {
 	shellMaxOutput     int           // shell 输出截断字节数
 	shellMatchMode     string        // shell 命令匹配模式: legacy / permissive / strict_chars / strict_glob
 	alert              *AlertChecker // agent 健康告警检查器; 可能为 nil
+	dispatchSem        chan struct{} // 指令并发信号量: 限制同时下发未回执的指令数量, 防止突发下发耗尽资源
+	pendingCmds        map[string]*StoredCmd // 内存中保留未脱敏的 pending 指令, 供 agent 重连后重发（DB 中 password 已脱敏无法重发）
+	pendingMu          sync.Mutex
+	shellRuleCache     struct { // shell 黑白名单内存缓存, 避免每次下发都查 DB
+		black []ShellRule
+		white []ShellRule
+		mu    sync.RWMutex
+		valid bool
+	}
 }
 
 // Shell 匹配模式常量。
@@ -86,6 +95,37 @@ func containsShellMetachars(s string) bool {
 	return strings.ContainsAny(s, ";&|`$\n\r()<>") || strings.Contains(s, "\\")
 }
 
+// shellRules 从缓存返回启用的黑白名单规则；缓存未命中时查 DB 并填充。
+func (s *Server) shellRules() (black, white []ShellRule) {
+	s.shellRuleCache.mu.RLock()
+	if s.shellRuleCache.valid {
+		black, white = s.shellRuleCache.black, s.shellRuleCache.white
+		s.shellRuleCache.mu.RUnlock()
+		return
+	}
+	s.shellRuleCache.mu.RUnlock()
+
+	s.shellRuleCache.mu.Lock()
+	defer s.shellRuleCache.mu.Unlock()
+	// double-check: 可能其他 goroutine 已填充
+	if s.shellRuleCache.valid {
+		return s.shellRuleCache.black, s.shellRuleCache.white
+	}
+	b, _ := s.Store.ListShellRules("blacklist", true)
+	w, _ := s.Store.ListShellRules("whitelist", true)
+	s.shellRuleCache.black = b
+	s.shellRuleCache.white = w
+	s.shellRuleCache.valid = true
+	return b, w
+}
+
+// InvalidateShellRules 使 shell 规则缓存失效，在规则增删改后调用。
+func (s *Server) InvalidateShellRules() {
+	s.shellRuleCache.mu.Lock()
+	s.shellRuleCache.valid = false
+	s.shellRuleCache.mu.Unlock()
+}
+
 // ShellAllowed 判断命令是否被策略允许执行。
 // 返回 (allowed, reason)。
 // 判定优先级: 黑名单 > 白名单 > 放行。
@@ -113,15 +153,14 @@ func (s *Server) ShellAllowed(command string) (bool, string) {
 		matchFn = globMatchStrict
 	}
 
+	blackRules, whiteRules := s.shellRules()
 	// 1. 黑名单优先
-	blackRules, _ := s.Store.ListShellRules("blacklist", true)
 	for _, r := range blackRules {
 		if matchFn(r.Pattern, command) {
 			return false, "blocked by blacklist: " + r.Pattern
 		}
 	}
 	// 2. 白名单非空则命令必须命中至少一条
-	whiteRules, _ := s.Store.ListShellRules("whitelist", true)
 	if len(whiteRules) == 0 {
 		return true, ""
 	}
@@ -227,7 +266,8 @@ func New(s *Store, trustedProxies []string, bindBootstrapToken bool, retentionMi
 		sessionTTL = 12 * time.Hour
 	}
 	srv := &Server{Store: s, sessions: map[string]*Session{}, uiHub: newUIHub(),
-		bindBootstrapToken: bindBootstrapToken, retentionMinDays: retentionMinDays, sessionTTL: sessionTTL, heartbeatTimeout: heartbeatTimeout}
+		bindBootstrapToken: bindBootstrapToken, retentionMinDays: retentionMinDays, sessionTTL: sessionTTL, heartbeatTimeout: heartbeatTimeout,
+		dispatchSem: make(chan struct{}, 256), pendingCmds: map[string]*StoredCmd{}}
 	for _, c := range trustedProxies {
 		c = strings.TrimSpace(c)
 		if c == "" {
@@ -361,6 +401,8 @@ func (s *Server) AgentWS(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[server] agent 上线: %s (%s) @ %s", agentID, reg.Hostname, ip)
 	_ = sess.Send(proto.Envelope{Kind: proto.KindOK, Payload: "registered"})
+	// 重连后重发该 agent 未完成的 pending 指令，修复下发后断线导致的指令丢失
+	s.ResendPending(agentID, sess)
 
 	go sess.writePump()
 	sess.readPump()
@@ -403,6 +445,11 @@ func (s *Server) handleScanResult(agentID, output string) {
 	if err := s.Store.UpsertAccountScan(agentID, accounts); err != nil {
 		log.Printf("[server] 存储 %s 的账户扫描结果失败: %v", agentID, err)
 		return
+	}
+	// 账户过期告警: 检查过期/即将过期账户并通知
+	if s.alert != nil {
+		hostname := s.Store.HostnameOf(agentID)
+		s.alert.NotifyAccountExpired(agentID, hostname, accounts)
 	}
 	// 向 UI 推送巡检更新事件
 	s.uiHub.Broadcast(map[string]any{
@@ -490,6 +537,20 @@ func (s *Server) SessionsIDs() []string {
 	return ids
 }
 
+// OnlineAgentCount 返回当前在线(已建立 WebSocket 会话)的 agent 数量。
+func (s *Server) OnlineAgentCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sessions)
+}
+
+// PendingCmdCount 返回内存中待回执指令数量。
+func (s *Server) PendingCmdCount() int {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return len(s.pendingCmds)
+}
+
 // randomHex 生成 n 字节随机数的 hex 编码。
 func randomHex(n int) string {
 	b := make([]byte, n)
@@ -524,7 +585,65 @@ func (s *Server) Send(agentID string, env proto.Envelope) bool {
 	if sess == nil {
 		return false
 	}
+	// 指令下发占用并发信号量；ping/pong 等控制消息不占用。
+	if env.Kind == proto.KindCmd {
+		select {
+		case s.dispatchSem <- struct{}{}:
+		default:
+			return false // 并发上限，拒绝本次下发
+		}
+		if !sess.Send(env) {
+			<-s.dispatchSem // 发送失败，立即释放信号量
+			return false
+		}
+		return true
+	}
 	return sess.Send(env)
+}
+
+// ReleaseDispatch 释放一个指令并发信号量槽位（收到 agent 回执或指令超时时调用）。
+func (s *Server) ReleaseDispatch() {
+	select {
+	case <-s.dispatchSem:
+	default:
+	}
+}
+
+// SavePendingCmd 在内存中保留未脱敏的指令副本，供 agent 重连后重发。
+// DB 落库时 password 已脱敏，重发必须用内存中的原始副本。
+func (s *Server) SavePendingCmd(c *StoredCmd) {
+	s.pendingMu.Lock()
+	s.pendingCmds[c.ID] = c
+	s.pendingMu.Unlock()
+}
+
+// PopPendingCmd 取出并删除内存中的 pending 指令副本（回执或超时时调用）。
+func (s *Server) PopPendingCmd(id string) *StoredCmd {
+	s.pendingMu.Lock()
+	c := s.pendingCmds[id]
+	delete(s.pendingCmds, id)
+	s.pendingMu.Unlock()
+	return c
+}
+
+// ResendPending 把该 agent 所有 pending 指令重新下发到新会话。
+// agent 断线重连后调用，修复"下发后断线导致指令丢失"的问题。
+func (s *Server) ResendPending(agentID string, sess *Session) {
+	ids, err := s.Store.PendingCmdIDs(agentID)
+	if err != nil || len(ids) == 0 {
+		return
+	}
+	s.pendingMu.Lock()
+	for _, id := range ids {
+		c, ok := s.pendingCmds[id]
+		if !ok {
+			continue // server 重启后内存无副本，跳过（需用户重新下发）
+		}
+		// 直接投递到会话 channel，不经过 Server.Send（避免重复占用信号量）
+		sess.Send(BuildCmd(c))
+	}
+	s.pendingMu.Unlock()
+	log.Printf("[server] agent %s 重连后重发 %d 条 pending 指令", agentID, len(ids))
 }
 
 // ---- Session ----
@@ -569,6 +688,8 @@ func (s *Session) readPump() {
 			_ = s.srv.Store.MarkSeen(s.AgentID)
 		case proto.KindResult:
 			if env.Result != nil {
+				s.srv.ReleaseDispatch()
+				s.srv.PopPendingCmd(env.Result.CmdID)
 				_ = s.srv.Store.FinishCmd(env.Result.CmdID, &ResultBody{
 					Output: env.Result.Output,
 					Err:    env.Result.Err,
@@ -711,9 +832,3 @@ func trim(s string) string {
 	}
 	return s
 }
-
-// keep imports used
-var _ = json.Marshal
-var _ = time.Second
-var _ = rand.Read
-var _ = hex.EncodeToString

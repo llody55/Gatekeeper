@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Gatekeeper · 账户救援管理平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+  <!-- ============ 登录页 ============ -->
+  <div id="loginPage" class="login-page">
+    <div class="login-bg">
+      <span class="blob b1"></span>
+      <span class="blob b2"></span>
+      <span class="blob b3"></span>
+      <div class="login-grid"></div>
+    </div>
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand-mark">GK</span>
+      </div>
+      <h1>Gatekeeper</h1>
+      <p class="login-sub">在线账户救援管理平台</p>
+      <form id="loginForm" autocomplete="on">
+        <label class="input-group">
+          <span class="input-icon" id="icUser"></span>
+          <input id="loginUser" type="text" maxlength="64" placeholder="用户名（默认 admin）" autocomplete="username">
+        </label>
+        <label class="input-group">
+          <span class="input-icon" id="icLock"></span>
+          <input id="loginPw" type="password" maxlength="128" placeholder="登录口令" autocomplete="current-password">
+        </label>
+        <div id="loginErr" class="login-err"></div>
+        <button id="loginBtn" type="submit" class="btn btn-primary btn-block btn-lg">
+          <span class="btn-label">登 录</span>
+          <span class="spinner"></span>
+        </button>
+      </form>
+      <p class="login-foot">首次启动的 admin 口令见 server 启动日志</p>
+    </div>
+    <div class="login-copy">© Gatekeeper · 让每一次账户救援在线完成</div>
+  </div>
+
+  <!-- ============ 应用主体 ============ -->
+  <div id="app" class="app hidden">
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-brand">
+        <span class="brand-mark sm">GK</span>
+        <div class="brand-txt">
+          <b>Gatekeeper</b>
+          <span id="sbVersion">v0.7.0</span>
+        </div>
+      </div>
+      <nav id="nav" class="nav"></nav>
+      <div class="sidebar-foot">
+        <button id="collapseBtn" class="collapse-btn" title="收起侧栏">
+          <span class="ico-collapse"></span>
+          <span class="collapse-txt">收起菜单</span>
+        </button>
+      </div>
+    </aside>
+
+    <div class="main-wrap">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="mobileToggle" class="icon-btn" title="菜单"></button>
+          <div id="breadcrumb" class="breadcrumb"></div>
+        </div>
+        <div class="topbar-right">
+          <span id="connState" class="conn-state" title="实时事件连接">
+            <i class="conn-dot"></i><span class="conn-txt">实时连接</span>
+          </span>
+          <div class="user-chip" id="userChip">
+            <span class="avatar" id="userAvatar">A</span>
+            <span class="user-meta">
+              <b id="userName">admin</b>
+              <span id="userRole">管理员</span>
+            </span>
+            <span class="caret"></span>
+            <div class="user-menu" id="userMenu">
+              <div class="user-menu-head">
+                <b id="umName">admin</b>
+                <span id="umRole">管理员</span>
+              </div>
+              <button id="logoutBtn" class="user-menu-item danger">退出登录</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main id="view" class="view"></main>
+    </div>
+  </div>
+
+  <!-- 全局浮层容器 -->
+  <div id="toastStack" class="toast-stack"></div>
+  <div id="modalRoot" class="modal-root"></div>
+
+  <!-- ============ 脚本（按依赖顺序加载） ============ -->
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/components.js"></script>
+  <script src="/static/js/views/dashboard.js"></script>
+  <script src="/static/js/views/agents.js"></script>
+  <script src="/static/js/views/rescue.js"></script>
+  <script src="/static/js/views/commands.js"></script>
+  <script src="/static/js/views/audit.js"></script>
+  <script src="/static/js/views/scans.js"></script>
+  <script src="/static/js/views/tokens.js"></script>
+  <script src="/static/js/views/users.js"></script>
+  <script src="/static/js/views/shell.js"></script>
+  <script src="/static/js/views/settings.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

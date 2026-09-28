@@ -28,7 +28,16 @@
 listen: ":8443"
 
 # SQLite 数据库路径。WAL 模式，可热备份(复制主文件 + 一次性 checkpoint 即可)。
+# 兼容旧配置: db_path 等价于 db.type=sqlite + db.dsn。
 db_path: "/var/lib/gatekeeper/gatekeeper.db"
+
+# 数据库配置(可选)。支持 sqlite / mysql / postgres。
+# 默认 sqlite; 切换到 mysql/postgres 时填写 dsn, sqlite 时 dsn 留空(用 db_path)。
+db:
+  type: "sqlite"  # sqlite / mysql / postgres
+  # MySQL 示例: "user:pass@tcp(127.0.0.1:3306)/gatekeeper?parseTime=true&charset=utf8mb4"
+  # PG 示例:    "postgres://user:pass@localhost:5432/gatekeeper?sslmode=disable"
+  dsn: ""
 
 # 日志级别: debug / info / warn / error
 log_level: "info"
@@ -77,12 +86,12 @@ defaults:
   # 留空(=0)时下限仍按 180 天兜底。
   history_retention: "4320h"  # 180 天
 
-# agent 健康告警。当某 agent 超过 offline_after 未心跳时, 向 webhook_url POST
-# 一次 JSON 事件(event=agent_offline); 该 agent 恢复心跳后, 再 POST 一次
-# agent_recovered 事件。同一 agent 同一状态去重, 不会每次扫描都重复发。
-# 测试: 登录后在后台 /api/alerts/test 可手动触发一次(仅 admin)。
+# agent 健康告警 + 账户巡检过期告警。
+# agent 离线: 某 agent 超过 offline_after 未心跳 -> 发告警; 恢复后发恢复事件。
+# 账户过期: 巡检发现 status=expired/password_expired, 或距过期 <= warn_days -> 发告警。
+# 通知通道: webhook(HTTP POST JSON) 与 邮件(SMTP), 可同时启用。
 alerts:
-  # 是否启用。false 或 webhook_url 留空则完全不启用(默认)。
+  # 是否启用。false 或 webhook/邮件均未配置则完全不启用(默认)。
   enabled: false
   # 多久未心跳触发告警, 默认 10 分钟。
   offline_after: "10m"
@@ -92,6 +101,20 @@ alerts:
   webhook_url: ""
   # 可选, 写入 X-Gatekeeper-Token 头, 用于校验请求来源。
   webhook_token: ""
+  # 邮件通知(可选)。SMTP 基础设施在此配置; 收件人优先取 admin 用户绑定的邮箱, 可在 Web 端「用户管理」中设置。
+  email:
+    enabled: false
+    host: "smtp.example.com:587"      # SMTP 服务器:端口
+    username: "alert@example.com"
+    password: ""                       # SMTP 密码/授权码
+    from: "alert@example.com"
+    to: ""                              # 全局收件人(可空, admin 邮箱 + 此值合并去重后发送)
+    use_starttls: true                 # 端口 587 用 STARTTLS(默认)
+    use_tls: false                     # 端口 465 用直连 TLS
+  # 账户过期告警(可选)。开关与阈值建议在 Web 端「系统设置」中配置。
+  account_expired:
+    enabled: false
+    warn_days: 7                       # 默认预警天数(可在 Web 端覆盖)
 
 # 通用 shell 下发配置。
 # shell 默认关闭, 需显式 enabled: true 开启。开启后可在 Web 控制台 Shell 页管理黑白名单规则。
@@ -103,3 +126,9 @@ shell:
   timeout: "60s"
   # 输出截断字节数(默认 65536), 防止大量输出撑爆内存。
   max_output: 65536
+
+# 观测性指标端点。
+# /healthz 始终暴露(供负载均衡/容器探活), 返回 JSON 含 status/db_ok/agents_online 等。
+# /metrics 输出 Prometheus text format, 供 Prometheus / VictoriaMetrics 抓取。
+metrics:
+  enabled: true  # 是否暴露 /metrics, 默认 true。生产建议通过内网/防火墙限制访问。

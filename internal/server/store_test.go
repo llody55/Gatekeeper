@@ -1,7 +1,6 @@
 package server
 
 import (
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +9,7 @@ import (
 // openTestStore 用内存 SQLite 打开测试用 Store。
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(":memory:")
+	s, err := Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}
@@ -463,7 +462,7 @@ func TestAuditFiltered(t *testing.T) {
 func TestCreateUserAndGetUser(t *testing.T) {
 	s := openTestStore(t)
 	h, _ := HashPassword("testpass123")
-	if err := s.CreateUser("testuser", h, "operator"); err != nil {
+	if err := s.CreateUser("testuser", h, "operator", ""); err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
 	u, hash, err := s.GetUser("testuser")
@@ -490,8 +489,8 @@ func TestCreateUserAndGetUser(t *testing.T) {
 func TestCreateUserDuplicate(t *testing.T) {
 	s := openTestStore(t)
 	h, _ := HashPassword("pass1")
-	_ = s.CreateUser("dupuser", h, "operator")
-	err := s.CreateUser("dupuser", h, "operator")
+	_ = s.CreateUser("dupuser", h, "operator", "")
+	err := s.CreateUser("dupuser", h, "operator", "")
 	if err == nil {
 		t.Error("重复用户名应报错")
 	}
@@ -500,7 +499,7 @@ func TestCreateUserDuplicate(t *testing.T) {
 func TestSetUserPassword(t *testing.T) {
 	s := openTestStore(t)
 	h1, _ := HashPassword("oldpass123")
-	_ = s.CreateUser("pwuser", h1, "operator")
+	_ = s.CreateUser("pwuser", h1, "operator", "")
 	h2, _ := HashPassword("newpass456")
 	if err := s.SetUserPassword("pwuser", h2); err != nil {
 		t.Fatalf("SetUserPassword: %v", err)
@@ -514,7 +513,7 @@ func TestSetUserPassword(t *testing.T) {
 func TestSetUserDisabled(t *testing.T) {
 	s := openTestStore(t)
 	h, _ := HashPassword("pass123")
-	_ = s.CreateUser("disuser", h, "operator")
+	_ = s.CreateUser("disuser", h, "operator", "")
 	if err := s.SetUserDisabled("disuser", true); err != nil {
 		t.Fatalf("SetUserDisabled true: %v", err)
 	}
@@ -534,9 +533,9 @@ func TestSetUserDisabled(t *testing.T) {
 func TestCountAdmins(t *testing.T) {
 	s := openTestStore(t)
 	h, _ := HashPassword("adminpass")
-	_ = s.CreateUser("admin1", h, "admin")
-	_ = s.CreateUser("admin2", h, "admin")
-	_ = s.CreateUser("op1", h, "operator")
+	_ = s.CreateUser("admin1", h, "admin", "")
+	_ = s.CreateUser("admin2", h, "admin", "")
+	_ = s.CreateUser("op1", h, "operator", "")
 	n, err := s.CountAdmins()
 	if err != nil {
 		t.Fatalf("CountAdmins: %v", err)
@@ -549,7 +548,7 @@ func TestCountAdmins(t *testing.T) {
 func TestDeleteUser(t *testing.T) {
 	s := openTestStore(t)
 	h, _ := HashPassword("pass123")
-	_ = s.CreateUser("deluser", h, "operator")
+	_ = s.CreateUser("deluser", h, "operator", "")
 	if err := s.DeleteUser("deluser"); err != nil {
 		t.Fatalf("DeleteUser: %v", err)
 	}
@@ -696,9 +695,9 @@ func TestEscapeLikeScenario(t *testing.T) {
 	s := openTestStore(t)
 	h, _ := HashPassword("pass")
 	// 创建含下划线（LIKE 通配符）的用户名
-	_ = s.CreateUser("test_user", h, "operator")
+	_ = s.CreateUser("test_user", h, "operator", "")
 	// 同时创建不含下划线的用户
-	_ = s.CreateUser("testxuser", h, "operator")
+	_ = s.CreateUser("testxuser", h, "operator", "")
 
 	// 模拟 session: v = "test_user|operator|9999999999"
 	_ = s.SettingSet("session:abc", "test_user|operator|9999999999")
@@ -717,6 +716,3 @@ func TestEscapeLikeScenario(t *testing.T) {
 		t.Error("testxuser 的会话不应被误删（LIKE 注入防护）")
 	}
 }
-
-// ---- 确保测试数据库文件不留痕 ----
-var _ = os.Remove

@@ -49,6 +49,17 @@ func validUsername(name string) (bool, string) {
 	return true, ""
 }
 
+// reEmail 邮箱格式校验(宽松匹配, 允许本地名含 ._-+)。
+var reEmail = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+
+// validEmail 校验邮箱格式, 空字符串视为合法(允许不绑定)。
+func validEmail(email string) bool {
+	if email == "" {
+		return true
+	}
+	return len(email) <= 254 && reEmail.MatchString(email)
+}
+
 // reAgentID agent_id 白名单: 字母/数字/点/下划线/连字符，1~maxAgentIDLen 位。
 var reAgentID = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,128}$`)
 
@@ -206,6 +217,11 @@ func (s *Server) Mux(cfg config.ServerConfig) http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("/agent", s.AgentWS)
 	m.HandleFunc("/ui/events", s.UIEventsGuard(cfg))
+	m.Handle("/static/", staticHandler())
+	m.HandleFunc("/healthz", s.handleHealthz)
+	if cfg.Metrics.Enabled {
+		m.HandleFunc("/metrics", s.handleMetrics)
+	}
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 			http.NotFound(w, r)
@@ -216,13 +232,118 @@ func (s *Server) Mux(cfg config.ServerConfig) http.Handler {
 	m.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		s.apiGuard(cfg)(http.HandlerFunc(s.apiMux)).ServeHTTP(w, r)
 	})
-	return m
+	return securityHeaders(m, cfg)
+}
+
+// securityHeaders 给所有响应追加安全头，降低点击劫持/MIME 嗅探/XSS 等风险。
+// HSTS 仅在启用 TLS 时下发。
+func securityHeaders(next http.Handler, cfg config.ServerConfig) http.Handler {
+	csp := "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws: wss:; " +
+		"frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		h.Set("X-XSS-Protection", "0")
+		if cfg.TLS.Cert != "" && cfg.TLS.Key != "" {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// healthzStatus 是 /healthz 响应结构。
+type healthzStatus struct {
+	Status           string `json:"status"`
+	Version          string `json:"version"`
+	AgentsOnline     int    `json:"agents_online"`
+	AgentsRegistered int    `json:"agents_registered"`
+	DBOK             bool   `json:"db_ok"`
+}
+
+// handleHealthz 返回服务健康状态, 供负载均衡/容器编排探活。
+// 始终返回 200 (即使 DB 异常也返回 200 但 db_ok=false),
+// 避免探活失败导致误重启; 监控系统可依据 db_ok 字段告警。
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	st := healthzStatus{
+		Status:       "ok",
+		Version:      version.String(),
+		AgentsOnline: s.OnlineAgentCount(),
+		DBOK:         true,
+	}
+	if n, err := s.Store.CountAgents(); err == nil {
+		st.AgentsRegistered = n
+	}
+	if err := s.Store.Ping(); err != nil {
+		st.Status = "degraded"
+		st.DBOK = false
+		log.Printf("[healthz] DB ping 失败: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(st)
+}
+
+// handleMetrics 以 Prometheus text exposition format 输出观测指标。
+// 不引入 prometheus client 依赖, 手动拼装文本, 便于 Prometheus / VictoriaMetrics 直接抓取。
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	var b strings.Builder
+	emit := func(help, name, typ, val string, labels ...string) {
+		fmt.Fprintf(&b, "# HELP %s %s\n", name, help)
+		fmt.Fprintf(&b, "# TYPE %s %s\n", name, typ)
+		if len(labels) > 0 {
+			fmt.Fprintf(&b, "%s{%s} %s\n", name, strings.Join(labels, ","), val)
+		} else {
+			fmt.Fprintf(&b, "%s %s\n", name, val)
+		}
+	}
+
+	emit("Gatekeeper build information.", "gatekeeper_build_info", "gauge", "1",
+		`version="`+version.String()+`"`)
+
+	emit("Number of agents currently connected via WebSocket.", "gatekeeper_agents_online", "gauge", strconv.Itoa(s.OnlineAgentCount()))
+
+	if n, err := s.Store.CountAgents(); err == nil {
+		emit("Total number of registered agents.", "gatekeeper_agents_registered", "gauge", strconv.Itoa(n))
+	}
+	emit("Number of commands pending agent acknowledgment.", "gatekeeper_cmds_pending", "gauge", strconv.Itoa(s.PendingCmdCount()))
+
+	if n, err := s.Store.CountCmds(); err == nil {
+		emit("Total number of commands historically dispatched.", "gatekeeper_cmds_total", "gauge", strconv.Itoa(n))
+	}
+	if n, err := s.Store.CountAudit(); err == nil {
+		emit("Total number of audit log entries.", "gatekeeper_audit_events_total", "gauge", strconv.Itoa(n))
+	}
+	if n, err := s.Store.CountShellRules(); err == nil {
+		emit("Total number of shell allow/deny rules.", "gatekeeper_shell_rules_total", "gauge", strconv.Itoa(n))
+	}
+	if n, err := s.Store.CountUsers(); err == nil {
+		emit("Total number of UI users.", "gatekeeper_users_total", "gauge", strconv.Itoa(n))
+	}
+	if n, err := s.Store.CountAdmins(); err == nil {
+		emit("Total number of admin users.", "gatekeeper_admins_total", "gauge", strconv.Itoa(n))
+	}
+	if n, err := s.Store.TokenCount(); err == nil {
+		emit("Total number of agent registration tokens.", "gatekeeper_tokens_total", "gauge", strconv.Itoa(n))
+	}
+	if n, err := s.Store.CountAccountScans(); err == nil {
+		emit("Total number of account scan records.", "gatekeeper_account_scans_total", "gauge", strconv.Itoa(n))
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte(b.String()))
 }
 
 // apiGuard 包装 API 处理器，校验管理会话；同时解析 actor/ip 并注入 context。
 func (s *Server) apiGuard(cfg config.ServerConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 限制请求体大小为 1MB，防止大请求耗尽内存
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			ac, ok := s.authCheck(w, r, cfg)
 			if !ok {
 				return
@@ -308,9 +429,6 @@ func (s *Server) checkSession(tok string) (string, string, bool) {
 	}
 	return parts[0], role, true
 }
-
-// 便捷别名
-var _ = fmt.Sprintf
 
 func withActor(r *http.Request, ac AuthCtx) *http.Request {
 	return r.WithContext(setCtx(r.Context(), ac))
@@ -452,7 +570,69 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/api/command/"):
 		s.handleCmdStatus(w, r)
 	case path == "/api/settings" && r.Method == http.MethodGet:
-		respond(w, map[string]any{"allow_query_token": false}, nil)
+		// 运行时配置: 告警开关、webhook、邮件收件人、预警阈值等, 存 settings 表, 可 Web 端热更。
+		getStr := func(k, def string) string {
+			v, _ := s.Store.SettingGet(k)
+			if v == "" {
+				return def
+			}
+			return v
+		}
+		getInt := func(k string, def int) int {
+			v, _ := s.Store.SettingGet(k)
+			if v == "" {
+				return def
+			}
+			if n, err := strconv.Atoi(v); err == nil {
+				return n
+			}
+			return def
+		}
+		adminEmails, _ := s.Store.ListAdminEmails()
+		respond(w, map[string]any{
+			"allow_query_token": false,
+			"alerts": map[string]any{
+				"enabled":               getStr("alert_enabled", "false") == "true",
+				"webhook_url":           getStr("alert_webhook_url", ""),
+				"email_to":              getStr("alert_email_to", ""),
+				"account_expired_enabled": getStr("alert_account_expired_enabled", "false") == "true",
+				"warn_days":             getInt("alert_warn_days", 7),
+				"admin_emails":          adminEmails,
+			},
+		}, nil)
+	case path == "/api/settings" && r.Method == http.MethodPost:
+		ac := actorOf(r)
+		if !ac.HasRole("admin") {
+			forbidden(w, r)
+			return
+		}
+		var body struct {
+			Alerts struct {
+				Enabled                 bool   `json:"enabled"`
+				WebhookURL              string `json:"webhook_url"`
+				EmailTo                 string `json:"email_to"`
+				AccountExpiredEnabled   bool   `json:"account_expired_enabled"`
+				WarnDays                int    `json:"warn_days"`
+			} `json:"alerts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			badRequest(w, "invalid json")
+			return
+		}
+		boolStr := func(b bool) string {
+			if b {
+				return "true"
+			}
+			return "false"
+		}
+		_ = s.Store.SettingSet("alert_enabled", boolStr(body.Alerts.Enabled))
+		_ = s.Store.SettingSet("alert_webhook_url", body.Alerts.WebhookURL)
+		_ = s.Store.SettingSet("alert_email_to", body.Alerts.EmailTo)
+		_ = s.Store.SettingSet("alert_account_expired_enabled", boolStr(body.Alerts.AccountExpiredEnabled))
+		_ = s.Store.SettingSet("alert_warn_days", strconv.Itoa(body.Alerts.WarnDays))
+		s.Store.Audit(ac.Actor, "settings_update", "alerts",
+			fmt.Sprintf("enabled=%v warn_days=%d email_to=%s", body.Alerts.Enabled, body.Alerts.WarnDays, body.Alerts.EmailTo), ac.IP)
+		respond(w, map[string]string{"status": "ok"}, nil)
 	case path == "/api/settings/retention" && r.Method == http.MethodGet:
 		min := s.retentionMinDays
 		v, _ := s.Store.SettingGet("audit_retention_days")
@@ -490,6 +670,8 @@ func (s *Server) apiMux(w http.ResponseWriter, r *http.Request) {
 		s.handleUserCreate(w, r)
 	case path == "/api/users/password" && r.Method == http.MethodPost:
 		s.handleUserPassword(w, r)
+	case path == "/api/users/email" && r.Method == http.MethodPost:
+		s.handleUserEmail(w, r)
 	case path == "/api/users/disable" && r.Method == http.MethodPost:
 		s.handleUserDisable(w, r)
 	case path == "/api/users/delete" && r.Method == http.MethodPost:
@@ -591,6 +773,7 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 		Role     string `json:"role"`
+		Email    string `json:"email"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if body.Username == "" || body.Password == "" {
@@ -601,8 +784,12 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, msg, http.StatusBadRequest)
 		return
 	}
-	if len(body.Password) < 8 {
-		jsonError(w, "password must be at least 8 characters", http.StatusBadRequest)
+	if ok, msg := ValidatePassword(body.Password); !ok {
+		jsonError(w, msg, http.StatusBadRequest)
+		return
+	}
+	if body.Email != "" && !validEmail(body.Email) {
+		jsonError(w, "invalid email format", http.StatusBadRequest)
 		return
 	}
 	if body.Role == "" {
@@ -617,12 +804,12 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "hash error", http.StatusInternalServerError)
 		return
 	}
-	if err := s.Store.CreateUser(body.Username, h, body.Role); err != nil {
+	if err := s.Store.CreateUser(body.Username, h, body.Role, body.Email); err != nil {
 		jsonError(w, "create failed (username may already exist)", http.StatusConflict)
 		return
 	}
-	s.Store.Audit(ac.Actor, "user_create", body.Username, "role="+body.Role, ac.IP)
-	respond(w, map[string]string{"username": body.Username, "role": body.Role}, nil)
+	s.Store.Audit(ac.Actor, "user_create", body.Username, fmt.Sprintf("role=%s email=%s", body.Role, body.Email), ac.IP)
+	respond(w, map[string]string{"username": body.Username, "role": body.Role, "email": body.Email}, nil)
 }
 
 func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
@@ -641,8 +828,8 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "username and password required", http.StatusBadRequest)
 		return
 	}
-	if len(body.Password) < 8 {
-		jsonError(w, "password must be at least 8 characters", http.StatusBadRequest)
+	if ok, msg := ValidatePassword(body.Password); !ok {
+		jsonError(w, msg, http.StatusBadRequest)
 		return
 	}
 	h, err := HashPassword(body.Password)
@@ -658,6 +845,35 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
 	s.Store.DeleteSessionsByActor(body.Username)
 	s.Store.Audit(ac.Actor, "user_password_change", body.Username, "", ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
+}
+
+// handleUserEmail 修改用户绑定邮箱。admin 可改任意用户, 其他角色只能改自己。
+func (s *Server) handleUserEmail(w http.ResponseWriter, r *http.Request) {
+	ac := actorOf(r)
+	var body struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	// 自助改邮箱 OR admin 改任意
+	if ac.Actor != body.Username && !ac.HasRole("admin") {
+		forbidden(w, r)
+		return
+	}
+	if body.Username == "" {
+		jsonError(w, "username required", http.StatusBadRequest)
+		return
+	}
+	if !validEmail(body.Email) {
+		jsonError(w, "invalid email format", http.StatusBadRequest)
+		return
+	}
+	if err := s.Store.UpdateUserEmail(body.Username, body.Email); err != nil {
+		respond(w, nil, err)
+		return
+	}
+	s.Store.Audit(ac.Actor, "user_email_change", body.Username, "email="+body.Email, ac.IP)
+	respond(w, map[string]string{"status": "ok", "email": body.Email}, nil)
 }
 
 func (s *Server) handleUserDisable(w http.ResponseWriter, r *http.Request) {
@@ -861,6 +1077,7 @@ func (s *Server) handleShellRuleAdd(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, fmt.Errorf("add rule: %w", err))
 		return
 	}
+	s.InvalidateShellRules()
 	ac := actorOf(r)
 	s.Store.Audit(ac.Actor, "shell_rule_add", strconv.FormatInt(id, 10), fmt.Sprintf("type=%s pattern=%s note=%s", body.Type, body.Pattern, body.Note), ac.IP)
 	respond(w, map[string]any{"id": id, "status": "ok"}, nil)
@@ -906,6 +1123,7 @@ func (s *Server) handleShellRuleUpdate(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, fmt.Errorf("update rule: %w", err))
 		return
 	}
+	s.InvalidateShellRules()
 	ac := actorOf(r)
 	s.Store.Audit(ac.Actor, "shell_rule_update", strconv.FormatInt(body.ID, 10), fmt.Sprintf("enabled=%v pattern=%s", body.Enabled, pattern), ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
@@ -928,6 +1146,7 @@ func (s *Server) handleShellRuleDelete(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, fmt.Errorf("delete rule: %w", err))
 		return
 	}
+	s.InvalidateShellRules()
 	ac := actorOf(r)
 	s.Store.Audit(ac.Actor, "shell_rule_delete", strconv.FormatInt(body.ID, 10), "", ac.IP)
 	respond(w, map[string]string{"status": "ok"}, nil)
@@ -1297,6 +1516,7 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	s.SavePendingCmd(c) // 内存保留未脱敏副本，供重连后重发
 	sent := s.Send(c.AgentID, BuildCmd(c))
 	status := "sent"
 	if !sent {
@@ -1374,6 +1594,7 @@ func (s *Server) handleDispatchBatch(w http.ResponseWriter, r *http.Request) {
 			Params: req.Params, CreatedBy: ac.Actor,
 		}
 		_ = s.Store.SaveCmd(c)
+		s.SavePendingCmd(c)
 		sent := s.Send(aid, BuildCmd(c))
 		results = append(results, oneRes{aid, c.ID, sent, ""})
 	}

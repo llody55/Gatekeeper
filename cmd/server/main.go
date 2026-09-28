@@ -31,12 +31,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	config.ApplyLogLevel(cfg.LogLevel)
 	if *addr != "" {
 		cfg.Listen = *addr
 	}
-	log.Printf("[gatekeeper-server] v%s 配置加载完成: listen=%s db=%s", version.String(), cfg.Listen, cfg.DBPath)
+	dbType := cfg.DB.Type
+	if dbType == "" {
+		dbType = "sqlite"
+	}
+	dbDSN := cfg.DB.DSN
+	if dbType == "sqlite" && dbDSN == "" {
+		dbDSN = cfg.DBPath
+	}
+	if dbDSN == "" {
+		dbDSN = "gatekeeper.db"
+	}
+	log.Printf("[gatekeeper-server] v%s 配置加载完成: listen=%s db=%s(%s) log_level=%s", version.String(), cfg.Listen, dbType, dbDSN, cfg.LogLevel)
 
-	store, err := server.Open(cfg.DBPath)
+	store, err := server.Open(dbType, dbDSN)
 	if err != nil {
 		log.Fatalf("打开数据库失败: %v", err)
 	}
@@ -55,8 +67,8 @@ func main() {
 	// 若 users 表无 admin 用户, 则创建一个(role=admin)。
 	if u, _, _ := store.GetUser("admin"); u == nil {
 		if adminHash == "" {
-			// 首次启动且未配置: 生成随机明文, 哈希落库, 明文仅打印一次。
-			plain := randomHex(8)
+			// 首次启动且未配置: 生成满足复杂度的随机口令, 哈希落库, 明文仅打印一次。
+			plain := generatePassword()
 			if h, err := server.HashPassword(plain); err == nil {
 				adminHash = h
 				_ = store.SettingSet("admin_password", h)
@@ -65,7 +77,7 @@ func main() {
 		} else {
 			log.Printf("[security] 已从老 settings.admin_password 迁移到 users 表")
 		}
-		if err := store.CreateUser("admin", adminHash, "admin"); err != nil {
+		if err := store.CreateUser("admin", adminHash, "admin", ""); err != nil {
 			log.Printf("[security] 创建 admin 用户失败: %v", err)
 		}
 	} else if cfg.UI.AdminPassword != "" {
@@ -166,6 +178,9 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           srv.Mux(cfg),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	log.Printf("[gatekeeper-server] 监听 %s (登录口令已在启动日志中显示)", cfg.Listen)
@@ -216,8 +231,9 @@ func runTimeoutSweeper(srv *server.Server, store *server.Store, timeout time.Dur
 	defer t.Stop()
 	for range t.C {
 		ids, _ := store.SweepTimeouts(timeout)
-		for range ids {
-			// 可在此广播 UI 通知；目前仅写库
+		for _, id := range ids {
+			srv.ReleaseDispatch() // 超时未回执的指令释放并发槽位
+			srv.PopPendingCmd(id) // 清理内存中的 pending 副本
 		}
 	}
 }
@@ -240,6 +256,41 @@ func randomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// generatePassword 生成满足复杂度要求的随机口令（含大写、小写、数字、特殊字符）。
+func generatePassword() string {
+	const (
+		lower   = "abcdefghijklmnopqrstuvwxyz"
+		upper   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+		digits  = "0123456789"
+		special = "!@#$%^&*-_=+?"
+	)
+	all := lower + upper + digits + special
+	rb := func() int { return int(randByte()) }
+	// 确保四类字符各至少一个
+	chars := []byte{
+		lower[rb()%len(lower)],
+		upper[rb()%len(upper)],
+		digits[rb()%len(digits)],
+		special[rb()%len(special)],
+	}
+	// 再补 8 个随机字符，总长 12
+	for i := 0; i < 8; i++ {
+		chars = append(chars, all[rb()%len(all)])
+	}
+	// 简单打乱
+	for i := len(chars) - 1; i > 0; i-- {
+		j := rb() % (i + 1)
+		chars[i], chars[j] = chars[j], chars[i]
+	}
+	return string(chars)
+}
+
+func randByte() byte {
+	var b [1]byte
+	_, _ = rand.Read(b[:])
+	return b[0]
 }
 
 // runRetentionWorker 每日按"DB settings -> YAML 下限"取较严格(较大)保留天数清理旧数据。

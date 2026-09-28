@@ -3,6 +3,60 @@
 本文件记录每个发行版的关键变更。版本号与仓库根目录 `VERSION` 文件一致。
 发版流程: 改 `VERSION` → `make build`（Makefile 通过 `-ldflags -X` 自动注入到二进制）→ 更新本文件。
 
+## v0.8.0 (2026-09-28)
+
+本版聚焦"前端重构 + 运行时可配置化 + 观测性 + 多数据库支持", 是面向生产部署的关键更新。核心变化: 运行时可变配置全部迁移到 Web 端设置页(无需重启), 用户绑定邮箱自动接收告警, 新增 Prometheus 指标与健康检查, 支持 MySQL/PostgreSQL 外部数据库。
+
+### 新增
+
+- **观测性 / 监控端点**:
+  - `/healthz` 返回 JSON 健康状态(status/version/agents_online/agents_registered/db_ok), 供负载均衡与容器探活。
+  - `/metrics` 输出 Prometheus text format(build_info / agents / cmds / audit / shell_rules / users / admins / tokens / account_scans), 受 `metrics.enabled` 控制(默认 true)。
+- **运行时配置 Web 端化**:
+  - 新增"系统设置"页(安全管理组), 可在线配置: 告警总开关、webhook 地址、邮件收件人、账户过期告警开关、预警天数。保存后立即生效, 无需重启。
+  - 配置分层原则: 基础设施(SMTP/调度间隔/DB 连接)保留在配置文件; 运行时可变项(告警开关/收件人/阈值/留存天数/shell 策略)存 DB settings 表热更。
+- **告警通知增强**:
+  - 通知通道: webhook(HTTP POST JSON) + 邮件(SMTP), 可同时启用。
+  - 邮件支持 STARTTLS(587) 与 TLS 直连(465) 两种模式。
+  - **账户过期告警**: 巡检发现 expired/password_expired 或距过期 ≤ warn_days 时推送通知, 同一账户只告警一次直到恢复。
+  - 收件人来源(合并去重): admin 用户绑定邮箱 → settings.alert_email_to → config 默认值。
+- **用户邮箱绑定**:
+  - users 表新增 email 字段, 创建用户时可绑定邮箱, 后续可随时修改。
+  - 权限: admin 可改任意用户邮箱, 其他角色只能改自己。
+  - admin 绑定的邮箱自动成为告警收件人, 无需在配置文件写死。
+- **外部数据库支持**:
+  - `db.type` 支持 sqlite(默认) / mysql / postgres。
+  - Store 层封装 dialect 差异(占位符 rebind、自增语法、Upsert、CREATE INDEX IF NOT EXISTS、LastInsertId), 切换数据库只需改配置。
+- **性能优化**:
+  - Store `sync.Mutex` → `sync.RWMutex`, 24 个纯读方法改用 RLock, `SetMaxOpenConns(1)` → `4`。
+  - shell 规则内存缓存, 命中后不再查库, 增删改后自动失效。
+  - 账户巡检避免每用户 fork `chage`, 直接读 `/etc/shadow` 解析。
+
+### 修复
+
+- **SettingSet MySQL 兼容**: `ON CONFLICT` 不被 MySQL 支持, 改为按方言分支(`ON CONFLICT` for sqlite/pg, `ON DUPLICATE KEY UPDATE` for mysql)。
+- **Store exec 封装栈溢出**: 批量替换 `s.db.Exec` → `s.exec` 时递归调用自身, 手动恢复三个封装方法内部的原始调用。
+
+### 安全
+
+- **运行时配置不落地配置文件**: 告警收件人、webhook URL、阈值等不再写入 YAML, 避免变更需重启且降低凭证泄露面。
+- **邮箱格式校验**: 用户邮箱使用正则白名单校验, 防止注入。
+- **权限隔离**: operator/auditor 只能改自己的邮箱, 不能修改其他用户信息。
+
+### 配置
+
+- 新增 `db.type` / `db.dsn` 支持外部数据库, 兼容旧 `db_path`。
+- `alerts.email.to` 改为可选默认值, 实际收件人优先取 admin 用户绑定邮箱。
+- `metrics.enabled` 控制 `/metrics` 暴露, 默认 true。
+- `tls.cert` / `tls.key` 配置后自动启用 HTTPS/WSS(已有, 1.0.0 将强化 TLS 策略)。
+
+### 测试
+
+- `go vet ./...` 通过。
+- `go test ./...` 全部通过(含 store 层 22+ 用例)。
+
+---
+
 ## v0.7.0 (2026-07-14)
 
 本版聚焦"稳定性加固 + 账户巡检自动化", 新增定时扫描主机账户过期状态并上报平台展示, 同时修复多项影响系统稳定性的问题。

@@ -282,7 +282,22 @@ func execShell(c *proto.Cmd) (output, errStr string, ok bool) {
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
+
+	// context 超时/取消时杀整个进程组（含子进程），避免 bash 被杀后子进程残留。
+	// exec.CommandContext 只杀主进程，Setpgid 创建独立进程组后需主动 kill -pgid。
+	killDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			if p := cmd.Process; p != nil {
+				_ = syscall.Kill(-p.Pid, syscall.SIGKILL)
+			}
+		case <-killDone:
+		}
+	}()
+
 	err := cmd.Run()
+	close(killDone)
 	duration := time.Since(start)
 
 	out := buf.String()
@@ -364,7 +379,8 @@ type AccountInfo struct {
 	WarnDays       int    `json:"warn_days"`       // 过期前警告天数
 }
 
-// scanAccounts 扫描主机上的非系统用户, 解析 chage -l 输出, 返回 JSON 数组。
+// scanAccounts 扫描主机上的非系统用户, 解析账户过期信息, 返回 JSON 数组。
+// 优化: 直接读取 /etc/shadow 获取密码策略字段, 避免对每个用户 fork 一次 chage。
 func scanAccounts(c *proto.Cmd) (string, bool) {
 	minUID := 0
 	if v := c.Params["min_uid"]; v != "" {
@@ -372,10 +388,17 @@ func scanAccounts(c *proto.Cmd) (string, bool) {
 			minUID = n
 		}
 	}
+	shadow := readShadow() // map[username][]field, 读失败则为 nil
 	var accounts []AccountInfo
 	users := listUsers(minUID)
 	for _, u := range users {
-		info := parseChage(u.username)
+		var info AccountInfo
+		if fields, ok := shadow[u.username]; ok {
+			info = parseShadowFields(u.username, fields)
+		} else {
+			// shadow 中无记录（如无读权限或用户无 shadow 条目），回退 chage
+			info = parseChage(u.username)
+		}
 		info.UID = u.uid
 		accounts = append(accounts, info)
 	}
@@ -384,6 +407,79 @@ func scanAccounts(c *proto.Cmd) (string, bool) {
 		return "", false
 	}
 	return string(b), true
+}
+
+// readShadow 读取 /etc/shadow 并返回 username -> 字段切片 的映射。
+// 读失败（如权限不足）返回 nil, 由调用方回退到 chage。
+func readShadow() map[string][]string {
+	data, err := os.ReadFile("/etc/shadow")
+	if err != nil {
+		log.Printf("[agent] 读取 /etc/shadow 失败, 回退 chage: %v", err)
+		return nil
+	}
+	m := make(map[string][]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 8 {
+			continue
+		}
+		m[fields[0]] = fields
+	}
+	return m
+}
+
+// daysToDate 把自 1970-01-01 起的天数转为 "YYYY-MM-DD"; 空/0 返回 "never"。
+func daysToDate(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return "never"
+	}
+	days, err := strconv.Atoi(s)
+	if err != nil || days <= 0 {
+		return "never"
+	}
+	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, days).Format("2006-01-02")
+}
+
+// atoiOrZero 解析整数字段, 失败或空返回 0。
+func atoiOrZero(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// parseShadowFields 从 /etc/shadow 字段解析账户信息。
+// shadow 字段: [0]user [1]pass [2]lastchange [3]min [4]max [5]warn [6]inactive [7]expire
+func parseShadowFields(user string, f []string) AccountInfo {
+	info := AccountInfo{
+		Username:       user,
+		Status:         "active",
+		LastChange:     daysToDate(f[2]),
+		MinDays:        atoiOrZero(f[3]),
+		MaxDays:        atoiOrZero(f[4]),
+		WarnDays:       atoiOrZero(f[5]),
+		InactiveDays:   atoiOrZero(f[6]),
+		ExpireDate:     daysToDate(f[7]),
+		PasswordExpire: "never",
+	}
+	// 密码过期日期 = 最后修改日期 + 最大天数
+	if info.LastChange != "never" && info.MaxDays > 0 {
+		if t, err := time.Parse("2006-01-02", info.LastChange); err == nil {
+			info.PasswordExpire = t.AddDate(0, 0, info.MaxDays).Format("2006-01-02")
+		}
+	}
+	info.Status = computeAccountStatus(info)
+	return info
 }
 
 type userEntry struct {

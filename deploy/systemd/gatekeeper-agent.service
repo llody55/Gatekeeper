@@ -1,0 +1,21 @@
+[Unit]
+Description=Gatekeeper Agent (主机账户巡检与救援执行端)
+Documentation=https://github.com/llody55/Gatekeeper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/gatekeeper-agent -config /etc/gatekeeper/agent.yaml
+Restart=on-failure
+RestartSec=5s
+# agent 需要 root 权限以读取 /etc/shadow / /etc/passwd 执行账户巡检
+# 如需降权, 可将 User 改为具备 CAP_DAC_READ_SEARCH 的专用账户
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gatekeeper-agent
+
+[Install]
+WantedBy=multi-user.target

@@ -8,7 +8,8 @@ package config
 
 import (
 	"fmt"
-	"io/fs"
+	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,7 +31,8 @@ var SearchPaths = []string{
 // ServerConfig 是 server 端配置。
 type ServerConfig struct {
 	Listen         string        `yaml:"listen"`    // 监听地址，默认 :8443
-	DBPath         string        `yaml:"db_path"`   // SQLite 路径，默认 gatekeeper.db
+	DBPath         string        `yaml:"db_path"`   // SQLite 路径，默认 gatekeeper.db（db.type=sqlite 时生效）
+	DB             DatabaseConfig `yaml:"db"`       // 数据库配置(支持 sqlite/mysql/postgres)
 	LogLevel       string        `yaml:"log_level"` // debug/info/warn/error
 	TLS            TLSConfig     `yaml:"tls"`
 	UI             UIConfig      `yaml:"ui"`
@@ -39,6 +41,21 @@ type ServerConfig struct {
 	TrustedProxies []string      `yaml:"trusted_proxies"` // 信任的前置代理 CIDR 列表；仅当直连对端 IP 命中此列表时方解析 X-Forwarded-For。默认空=不信任任何 XFF，公网部署必须留空
 	Alerts         AlertConfig   `yaml:"alerts"`          // agent 健康告警配置
 	Shell          ShellConfig   `yaml:"shell"`           // 通用 shell 下发配置
+	Metrics        MetricsConfig `yaml:"metrics"`         // 观测性指标端点配置
+}
+
+// DatabaseConfig 数据库连接配置。
+// type 可选: sqlite(默认, 纯 Go 驱动, 零依赖) / mysql / postgres。
+// sqlite 时 dsn 可为空, 使用 db_path; mysql/postgres 时必须填 dsn。
+type DatabaseConfig struct {
+	Type string `yaml:"type"` // sqlite / mysql / postgres, 默认 sqlite
+	DSN  string `yaml:"dsn"`  // 连接串, 如 "user:pass@tcp(127.0.0.1:3306)/gk" 或 "postgres://user:pass@localhost/gk?sslmode=disable"
+}
+
+// MetricsConfig 控制 /metrics 与 /healthz 端点的暴露。
+// /healthz 始终暴露(供负载均衡探活); /metrics 由 enabled 控制, 默认启用。
+type MetricsConfig struct {
+	Enabled bool `yaml:"enabled"` // 是否暴露 /metrics (Prometheus text format), 默认 true
 }
 
 // ShellConfig 通用 shell 命令下发策略。
@@ -50,15 +67,36 @@ type ShellConfig struct {
 	MaxOutput int           `yaml:"max_output"` // 输出截断字节数, 默认 65536
 }
 
-// AlertConfig agent 健康告警配置。
-// 触发条件: agent 超过 OfflineAfter 未心跳 -> POST 一次 webhook。
-// 恢复后再次心跳 -> POST restore 事件。同一 agent 同一状态去重, 不重复发。
+// AlertConfig agent 健康告警 + 账户巡检过期告警配置。
+// 通知通道: webhook(HTTP POST JSON) 与 邮件(SMTP), 可同时启用。
+// agent 离线: 超过 OfflineAfter 未心跳 -> 发告警; 恢复后发恢复事件。
+// 账户过期: 巡检发现 status=expired/password_expired, 或距过期 <= WarnDays -> 发告警。
 type AlertConfig struct {
-	Enabled       bool          `yaml:"enabled"`        // 是否启用告警
-	OfflineAfter  time.Duration `yaml:"offline_after"`  // 多久未心跳触发告警, 默认 10 分钟
-	WebhookURL    string        `yaml:"webhook_url"`    // 目标 URL, POST JSON
-	WebhookToken  string        `yaml:"webhook_token"`  // 可选, 写入 X-Gatekeeper-Token 头
-	CheckInterval time.Duration `yaml:"check_interval"` // 检查周期, 默认 60s
+	Enabled        bool          `yaml:"enabled"`         // 是否启用告警
+	OfflineAfter   time.Duration `yaml:"offline_after"`   // agent 多久未心跳触发告警, 默认 10 分钟
+	CheckInterval  time.Duration `yaml:"check_interval"`  // 检查周期, 默认 60s
+	WebhookURL     string        `yaml:"webhook_url"`     // webhook 目标 URL, POST JSON
+	WebhookToken   string        `yaml:"webhook_token"`   // 可选, 写入 X-Gatekeeper-Token 头
+	Email          EmailConfig   `yaml:"email"`           // SMTP 邮件通知(可选)
+	AccountExpired AccountAlert  `yaml:"account_expired"` // 账户过期告警(可选)
+}
+
+// EmailConfig SMTP 邮件通知配置。
+type EmailConfig struct {
+	Enabled   bool   `yaml:"enabled"`    // 是否启用邮件
+	Host      string `yaml:"host"`       // SMTP 服务器地址, 如 smtp.example.com:587
+	Username  string `yaml:"username"`   // SMTP 用户名
+	Password  string `yaml:"password"`   // SMTP 密码/授权码
+	From      string `yaml:"from"`       // 发件人地址
+	To        string `yaml:"to"`         // 收件人地址(多个用逗号分隔)
+	UseTLS    bool   `yaml:"use_tls"`    // 是否使用 TLS(端口 465)
+	UseStartTLS bool `yaml:"use_starttls"` // 是否使用 STARTTLS(端口 587, 默认 true)
+}
+
+// AccountAlert 账户巡检过期告警配置。
+type AccountAlert struct {
+	Enabled  bool `yaml:"enabled"`   // 是否启用账户过期告警
+	WarnDays int  `yaml:"warn_days"` // 距过期多少天内开始预警, 默认 7
 }
 
 // TLSConfig TLS 配置。
@@ -133,11 +171,20 @@ func DefaultServer() ServerConfig {
 		Alerts: AlertConfig{
 			OfflineAfter:  10 * time.Minute,
 			CheckInterval: 60 * time.Second,
+			AccountExpired: AccountAlert{
+				WarnDays: 7,
+			},
+			Email: EmailConfig{
+				UseStartTLS: true,
+			},
 		},
 		Shell: ShellConfig{
 			Enabled:   false,
 			Timeout:   60 * time.Second,
 			MaxOutput: 65536,
+		},
+		Metrics: MetricsConfig{
+			Enabled: true,
 		},
 	}
 }
@@ -261,4 +308,16 @@ func IsValidMode(s string) bool {
 	return false
 }
 
-var _ fs.FileInfo
+// ApplyLogLevel 根据配置的 log_level 设置标准库 log 的输出行为。
+// debug 级别：显示文件:行号与微秒，便于排查；其余级别使用标准格式。
+// 标准库 log 无级别的概念，所有日志统一输出；debug 通过更详细的格式区分。
+func ApplyLogLevel(level string) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+		log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
+	default:
+		slog.SetLogLoggerLevel(slog.LevelInfo)
+		log.SetFlags(log.LstdFlags)
+	}
+}

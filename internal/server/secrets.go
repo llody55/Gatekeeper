@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"unicode"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -30,4 +31,42 @@ func HashPassword(pw string) (string, error) {
 // CheckPassword 比对明文口令与 bcrypt 哈希。
 func CheckPassword(hashed, pw string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hashed), []byte(pw)) == nil
+}
+
+// ValidatePassword 校验口令复杂度：长度>=8，且大写/小写/数字/特殊字符四类中至少包含三类。
+// 返回 (是否合法, 失败原因)。
+func ValidatePassword(pw string) (bool, string) {
+	if len(pw) < 8 {
+		return false, "password must be at least 8 characters"
+	}
+	var upper, lower, digit, special bool
+	for _, r := range pw {
+		switch {
+		case unicode.IsUpper(r):
+			upper = true
+		case unicode.IsLower(r):
+			lower = true
+		case unicode.IsDigit(r):
+			digit = true
+		case unicode.IsPunct(r) || unicode.IsSymbol(r):
+			special = true
+		}
+	}
+	categories := 0
+	if upper {
+		categories++
+	}
+	if lower {
+		categories++
+	}
+	if digit {
+		categories++
+	}
+	if special {
+		categories++
+	}
+	if categories < 3 {
+		return false, "password must contain at least 3 of: uppercase, lowercase, digit, special character"
+	}
+	return true, ""
 }

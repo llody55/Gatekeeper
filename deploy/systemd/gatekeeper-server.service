@@ -1,0 +1,29 @@
+[Unit]
+Description=Gatekeeper Server (在线账户救援管理平台)
+Documentation=https://github.com/llody55/Gatekeeper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gatekeeper
+Group=gatekeeper
+ExecStart=/usr/local/bin/gatekeeper-server -config /etc/gatekeeper/gatekeeper.yaml
+Restart=on-failure
+RestartSec=5s
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gatekeeper
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gatekeeper-server
+
+[Install]
+WantedBy=multi-user.target
